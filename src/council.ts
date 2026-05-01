@@ -184,6 +184,42 @@ function loadConfig(mode: CouncilMode = "fast"): CouncilConfig {
 
 // --- Subprocess dispatch ---
 
+/**
+ * Drain a ReadableStream into a string while updating a byte counter as bytes arrive.
+ * Used by the dispatch watchdog to distinguish "agent thinking + producing output"
+ * from "agent silent (probably hung)" — see Path C in plan file.
+ *
+ * Behavior matches `new Response(stream).text()` for the return value:
+ * UTF-8 decoded, full content, with trailing partial-codepoint flush at EOF.
+ * The byte counter increments per chunk so a setInterval watchdog can sample it.
+ */
+export async function streamAndCount(
+  stream: ReadableStream<Uint8Array>,
+  byteCounter: { count: number }
+): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder("utf-8");
+  let full = "";
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      byteCounter.count += value.byteLength;
+      full += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    full += decoder.decode();
+    reader.releaseLock();
+  }
+  return full;
+}
+
+export function formatByteSize(n: number): string {
+  if (n < 1024) return `${n}B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
+  return `${(n / (1024 * 1024)).toFixed(2)}MB`;
+}
+
 async function dispatchAgent(
   adapter: AgentAdapter,
   prompt: string,
@@ -201,12 +237,33 @@ async function dispatchAgent(
   });
   if (procRef) procRef.proc = proc;
 
-  // Heartbeat: emit a liveness line every 30s while the subprocess runs so
-  // the user can tell "thinking" from "hung" during max-effort dispatches.
+  // Byte-flow heartbeat: count bytes drained from stdout as they arrive so the
+  // watchdog can distinguish "agent producing output" from "agent silent". A
+  // hung Gemini and a deeply-thinking Gemini are indistinguishable from
+  // subprocess aliveness alone — this counter is the missing liveness signal.
+  const byteCounter = { count: 0 };
+  let bytesAtLastTick = 0;
+  let silentTicks = 0;
+
   const watchdog = setInterval(() => {
     const elapsedSec = Math.floor((Date.now() - startTime) / 1000);
     const totalSec = timeoutMs === UNBOUNDED_TIMEOUT_MS ? "∞" : `${Math.floor(timeoutMs / 1000)}`;
-    console.error(`  [${adapter.id}: still thinking, ${elapsedSec}s/${totalSec}, effort=${opts.effort}]`);
+    const newBytes = byteCounter.count - bytesAtLastTick;
+    bytesAtLastTick = byteCounter.count;
+
+    if (newBytes > 0) {
+      silentTicks = 0;
+      console.error(
+        `  [${adapter.id}: still thinking, ${elapsedSec}s/${totalSec}, effort=${opts.effort}, +${formatByteSize(newBytes)} new]`
+      );
+    } else {
+      silentTicks++;
+      const silentSec = silentTicks * 30;
+      const label = silentTicks >= 3 ? "STALLED" : "still thinking";
+      console.error(
+        `  [${adapter.id}: ${label}, ${elapsedSec}s/${totalSec}, effort=${opts.effort}, no output for ${silentSec}s]`
+      );
+    }
   }, 30_000);
 
   let timedOut = false;
@@ -220,7 +277,7 @@ async function dispatchAgent(
   try {
     const [exitCode, stdout, stderr] = await Promise.all([
       proc.exited,
-      new Response(proc.stdout).text(),
+      streamAndCount(proc.stdout, byteCounter),
       new Response(proc.stderr).text(),
     ]);
     clearTimeout(timer);

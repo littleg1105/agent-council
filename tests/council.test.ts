@@ -1,7 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import { mkdirSync, writeFileSync, rmSync } from "fs";
 import { resolve } from "path";
-import { buildContextBundle } from "../src/council";
+import { buildContextBundle, streamAndCount, formatByteSize } from "../src/council";
 
 const tmpDir = resolve(import.meta.dir, ".tmp-council-test");
 
@@ -56,5 +56,97 @@ describe("buildContextBundle security", () => {
 
   test("cleanup", () => {
     rmSync(tmpDir, { recursive: true, force: true });
+  });
+});
+
+// --- Byte-flow heartbeat helpers ---
+
+describe("streamAndCount", () => {
+  test("returns full UTF-8 decoded content matching new Response().text()", async () => {
+    const text = "hello\n世界\n{\"type\":\"item.completed\"}\n";
+    const bytes = new TextEncoder().encode(text);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+
+    const counter = { count: 0 };
+    const out = await streamAndCount(stream, counter);
+    expect(out).toBe(text);
+    expect(counter.count).toBe(bytes.byteLength);
+  });
+
+  test("counter increments per chunk as bytes arrive", async () => {
+    // Three separate chunks; the counter should increment each time so a
+    // setInterval-based watchdog can sample it incrementally.
+    const chunks = ["alpha\n", "beta\n", "gamma\n"];
+    const enc = new TextEncoder();
+    const stream = new ReadableStream<Uint8Array>({
+      async start(controller) {
+        for (const c of chunks) {
+          controller.enqueue(enc.encode(c));
+          await new Promise((r) => setTimeout(r, 5));
+        }
+        controller.close();
+      },
+    });
+
+    const counter = { count: 0 };
+    const out = await streamAndCount(stream, counter);
+    expect(out).toBe("alpha\nbeta\ngamma\n");
+    expect(counter.count).toBe(enc.encode("alpha\nbeta\ngamma\n").byteLength);
+  });
+
+  test("handles UTF-8 split across chunk boundaries", async () => {
+    // The 4-byte emoji U+1F600 (😀) split across two chunks. TextDecoder({stream:true})
+    // must reassemble it; the final decoder.decode() flush ensures no replacement char.
+    const enc = new TextEncoder();
+    const fullBytes = enc.encode("a😀b");
+    const split = 2; // splits inside the emoji bytes
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(fullBytes.slice(0, split));
+        controller.enqueue(fullBytes.slice(split));
+        controller.close();
+      },
+    });
+
+    const counter = { count: 0 };
+    const out = await streamAndCount(stream, counter);
+    expect(out).toBe("a😀b");
+    expect(counter.count).toBe(fullBytes.byteLength);
+  });
+
+  test("empty stream produces empty string and zero count", async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.close();
+      },
+    });
+    const counter = { count: 0 };
+    const out = await streamAndCount(stream, counter);
+    expect(out).toBe("");
+    expect(counter.count).toBe(0);
+  });
+});
+
+describe("formatByteSize", () => {
+  test("bytes under 1KB display as B", () => {
+    expect(formatByteSize(0)).toBe("0B");
+    expect(formatByteSize(512)).toBe("512B");
+    expect(formatByteSize(1023)).toBe("1023B");
+  });
+
+  test("KB range with one decimal", () => {
+    expect(formatByteSize(1024)).toBe("1.0KB");
+    expect(formatByteSize(2560)).toBe("2.5KB");
+    expect(formatByteSize(1024 * 1024 - 1)).toBe("1024.0KB");
+  });
+
+  test("MB range with two decimals", () => {
+    expect(formatByteSize(1024 * 1024)).toBe("1.00MB");
+    expect(formatByteSize(5 * 1024 * 1024)).toBe("5.00MB");
   });
 });

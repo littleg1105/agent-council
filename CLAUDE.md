@@ -32,7 +32,7 @@ Fixtures: `tests/fixtures/` — real CLI output from Claude, Codex, Gemini
 - `dispatchAgentWithRetry()` retries transient failures (timeout, rate_limit) once
 - `parseStructuredSections()` uses fuzzy heading aliases for assumption/belief parsing
 - `runNudge()` dispatches Stage 4 correction to a single agent, saves to `stage4/`
-- `dispatchAgent()` emits a heartbeat every 30s during execution: `[<agent>: still thinking, Xs/Ys, effort=<level>]` (preflight is uninstrumented — uses its own subprocess path)
+- `dispatchAgent()` emits a byte-flow heartbeat every 30s. When stdout produced output: `[<agent>: still thinking, Xs/Ys, effort=<level>, +NKB new]`. When silent: `[<agent>: still thinking, Xs/Ys, effort=<level>, no output for Ts]`. After 3 consecutive silent ticks (90s+): label flips to `STALLED` so the user can distinguish "agent thinking" from "agent hung". Backed by `streamAndCount()` which incrementally drains stdout into a byte counter while preserving the same final string for `parseOutput`. Preflight is uninstrumented (uses its own subprocess path).
 - On timeout, `dispatchAgent()` salvages buffered stdout via the adapter's `parseOutput`. If salvage produces a non-empty response, it's attached as `partial_response` (Codex's tolerant JSONL parser is the typical winner here). Synthesis ignores partials; the viewer surfaces them with a "(timed out — partial recovery)" badge.
 
 ## Storage
