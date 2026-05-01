@@ -201,6 +201,14 @@ async function dispatchAgent(
   });
   if (procRef) procRef.proc = proc;
 
+  // Heartbeat: emit a liveness line every 30s while the subprocess runs so
+  // the user can tell "thinking" from "hung" during max-effort dispatches.
+  const watchdog = setInterval(() => {
+    const elapsedSec = Math.floor((Date.now() - startTime) / 1000);
+    const totalSec = timeoutMs === UNBOUNDED_TIMEOUT_MS ? "∞" : `${Math.floor(timeoutMs / 1000)}`;
+    console.error(`  [${adapter.id}: still thinking, ${elapsedSec}s/${totalSec}, effort=${opts.effort}]`);
+  }, 30_000);
+
   let timedOut = false;
   let killTimer: ReturnType<typeof setTimeout> | null = null;
   const timer = setTimeout(() => {
@@ -217,14 +225,26 @@ async function dispatchAgent(
     ]);
     clearTimeout(timer);
     if (killTimer) clearTimeout(killTimer);
+    clearInterval(watchdog);
     const durationMs = Date.now() - startTime;
 
     if (timedOut) {
+      // Partial-on-timeout salvage: feed the buffered stdout through the adapter
+      // parser. Codex's tolerant JSONL try/catch already extracts complete events
+      // from a truncated buffer; Claude/Gemini's strict JSON.parse will throw and
+      // return status:"error", in which case we omit the partial fields.
+      const salvaged = adapter.parseOutput(stdout, stderr, -1, durationMs);
+      const hasPartial = salvaged.status === "ok" && salvaged.response.length > 0;
+      if (hasPartial) {
+        console.error(`  ${adapter.id}: salvaged ${salvaged.response.length} bytes of partial response`);
+      }
       return {
         agent: adapter.id,
         status: "timeout",
         structured: false,
         response: "",
+        partial_response: hasPartial ? salvaged.response : undefined,
+        partial_recommendation: hasPartial ? salvaged.recommendation : undefined,
         error: `Agent did not respond within ${timeoutMs / 1000} seconds`,
         error_class: "timeout" as ErrorClass,
         raw_stderr: stderr,
@@ -241,6 +261,7 @@ async function dispatchAgent(
   } catch (e: any) {
     clearTimeout(timer);
     if (killTimer) clearTimeout(killTimer);
+    clearInterval(watchdog);
     return {
       agent: adapter.id,
       status: "error",

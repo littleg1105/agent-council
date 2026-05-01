@@ -150,6 +150,8 @@ export function generateViewer(
       response: o.response,
       error: o.error,
       duration_ms: o.duration_ms,
+      partial_response: o.partial_response,
+      partial_recommendation: o.partial_recommendation,
     })),
     synthesis,
     reviews: reviews.map((r) => ({ agent: r.agent, status: r.status, response: r.response, duration_ms: r.duration_ms })),
@@ -1592,10 +1594,52 @@ function renderOpinions(opinions) {
     var body = el('div', { className: 'agent-card-body' });
 
     if (op.status !== 'ok') {
+      var hasPartial = op.status === 'timeout' && op.partial_response && op.partial_response.length > 0;
+
       body.appendChild(el('div', { className: 'agent-sub' },
-        el('div', { style: { color: 'var(--error)', fontFamily: 'var(--font-label)', fontSize: '0.75rem' } },
-          'Agent returned ' + op.status + (op.error ? ': ' + op.error : ''))
+        el('div', { style: { color: hasPartial ? 'var(--warning, #c98a14)' : 'var(--error)', fontFamily: 'var(--font-label)', fontSize: '0.75rem' } },
+          hasPartial
+            ? '(timed out — partial recovery)' + (op.error ? ': ' + op.error : '')
+            : 'Agent returned ' + op.status + (op.error ? ': ' + op.error : ''))
       ));
+
+      if (hasPartial) {
+        // Disclaimer
+        body.appendChild(el('div', { className: 'agent-sub' },
+          el('div', { style: { color: 'var(--on-surface-3)', fontSize: '0.7rem', fontStyle: 'italic' } },
+            'This response was truncated by timeout. The chairman synthesis ignores partial content; this is shown for diagnostic value only.')
+        ));
+
+        // Partial recommendation if salvaged
+        if (op.partial_recommendation) {
+          var partialRecSub = el('div', { className: 'agent-sub' });
+          partialRecSub.appendChild(el('div', { className: 'agent-sub-label' }, 'Partial recommendation'));
+          partialRecSub.appendChild(mdEl('agent-sub-text', op.partial_recommendation));
+          body.appendChild(partialRecSub);
+        }
+
+        // Full partial response — collapsed transcript style
+        var ptSub = el('div', { className: 'agent-sub' });
+        var ptToggle = el('button', { className: 'transcript-toggle' });
+        var ptChev = el('span', null, '\\u25b8');
+        ptToggle.appendChild(ptChev);
+        ptToggle.appendChild(document.createTextNode(' Partial response (' + op.partial_response.length + ' bytes)'));
+
+        var ptBody = el('div', { className: 'transcript-body' });
+        ptBody.appendChild(el('pre', { className: 'transcript-text' }, op.partial_response));
+
+        (function(chev, tbody) {
+          ptToggle.addEventListener('click', function() {
+            var open = tbody.classList.toggle('open');
+            chev.textContent = open ? '\\u25be' : '\\u25b8';
+          });
+        })(ptChev, ptBody);
+
+        ptSub.appendChild(ptToggle);
+        ptSub.appendChild(ptBody);
+        body.appendChild(ptSub);
+      }
+
       panel.appendChild(body);
       panels.push(panel);
       continue;

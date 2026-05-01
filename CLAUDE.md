@@ -32,6 +32,8 @@ Fixtures: `tests/fixtures/` — real CLI output from Claude, Codex, Gemini
 - `dispatchAgentWithRetry()` retries transient failures (timeout, rate_limit) once
 - `parseStructuredSections()` uses fuzzy heading aliases for assumption/belief parsing
 - `runNudge()` dispatches Stage 4 correction to a single agent, saves to `stage4/`
+- `dispatchAgent()` emits a heartbeat every 30s during execution: `[<agent>: still thinking, Xs/Ys, effort=<level>]` (preflight is uninstrumented — uses its own subprocess path)
+- On timeout, `dispatchAgent()` salvages buffered stdout via the adapter's `parseOutput`. If salvage produces a non-empty response, it's attached as `partial_response` (Codex's tolerant JSONL parser is the typical winner here). Synthesis ignores partials; the viewer surfaces them with a "(timed out — partial recovery)" badge.
 
 ## Storage
 
@@ -42,7 +44,7 @@ Config: `~/.council/config.json`
 
 - Timeouts (per mode): `quick` 180s · `fast` (default) 600s · `thorough` 900s. All agents share the per-mode value unless `~/.council/config.json` overrides per-agent.
 - Reasoning effort (per mode): `quick` high · `fast` max · `thorough` max. Claude → `--effort <level>`; Codex → `-c model_reasoning_effort=<level>` (`max` maps to `xhigh`); Gemini has no flag (Gemini 3 thinks by default).
-- Quorum grace: `quick` 30s · `fast` 60s · `thorough` 180s
+- Quorum grace: `quick` 180s · `fast` 600s · `thorough` 900s. Each grace floor matches its mode's per-agent timeout — once quorum is reached, stragglers get their full per-agent budget. The `dispatchWithQuorum` clamp also extends grace if user config sets a longer per-agent timeout, so no agent is ever cut below its own limit.
 - Models: claude-opus-4-6, gpt-5.4, gemini-3.1-pro
 - Proactive nudges: true
 

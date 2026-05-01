@@ -58,6 +58,10 @@ export interface AgentResult {
   raw_stderr?: string;
   duration_ms: number;
   timestamp: string;
+  // Set on timeout when the buffered stdout had parseable content (additive, optional).
+  // The chairman synthesis ignores these; the viewer surfaces them with a partial-recovery badge.
+  partial_response?: string;
+  partial_recommendation?: string;
 }
 
 export interface PreflightStatus {

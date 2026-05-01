@@ -32,6 +32,17 @@ describe("claudeAdapter", () => {
     expect(result.raw_response).toBe("{broken json");
   });
 
+  test("parseOutput: truncated JSON (mid-string) returns error — salvage path will skip", () => {
+    // Verifies that a SIGTERMed Claude returning '{"result":"hello' produces
+    // status:"error", which the dispatchAgent timeout salvage gates on to AVOID
+    // attaching garbage as partial_response. Codex tolerates truncation; Claude
+    // and Gemini do not — this asymmetry is intentional.
+    const result = claudeAdapter.parseOutput('{"result":"hello', "", -1, 30000);
+
+    expect(result.status).toBe("error");
+    expect(result.response).toBe("");
+  });
+
   test("parseOutput: empty stdout returns error envelope", () => {
     const result = claudeAdapter.parseOutput("", "", 0, 100);
 
@@ -93,6 +104,21 @@ describe("codexAdapter", () => {
 
     expect(result.status).toBe("ok");
     expect(result.response).toBe("Result");
+  });
+
+  test("parseOutput: truncated JSONL (mid-line at end) salvages prior complete events", () => {
+    // Simulates SIGTERM mid-stream: the trailing line is half-written.
+    // The Codex partial-on-timeout salvage path depends on this behavior.
+    const stdout = [
+      '{"type":"thread.started"}',
+      '{"type":"item.completed","item":{"text":"First chunk."}}',
+      '{"type":"item.completed","item":{"text":"Second chunk."}}',
+      '{"type":"item.completed","item":{"text"',  // truncated trailing line
+    ].join("\n");
+    const result = codexAdapter.parseOutput(stdout, "", -1, 30000);
+
+    expect(result.status).toBe("ok");
+    expect(result.response).toBe("First chunk.Second chunk.");
   });
 
   test("parseOutput: empty stdout returns error", () => {
@@ -336,5 +362,45 @@ describe("detectAgents", () => {
     const agents = await detectAgents();
     // We know all 3 are installed on this machine from preflight
     expect(agents.length).toBeGreaterThanOrEqual(2);
+  });
+});
+
+// --- Partial-on-timeout schema ---
+
+describe("AgentResult partial fields", () => {
+  test("partial_response and partial_recommendation are optional and accepted by the schema", () => {
+    // Type-level assertion that the fields exist and are optional. If this compiles
+    // and runs, the schema contract is intact for the dispatchAgent timeout salvage.
+    const partial: import("../src/adapters").AgentResult = {
+      agent: "codex",
+      status: "timeout",
+      structured: false,
+      response: "",
+      partial_response: "salvaged content",
+      partial_recommendation: "use Postgres",
+      error: "Agent did not respond within 30 seconds",
+      error_class: "timeout",
+      duration_ms: 30000,
+      timestamp: new Date().toISOString(),
+    };
+
+    expect(partial.partial_response).toBe("salvaged content");
+    expect(partial.partial_recommendation).toBe("use Postgres");
+    expect(partial.status).toBe("timeout");
+    expect(partial.response).toBe("");
+  });
+
+  test("AgentResult without partial fields is still valid (backward compat)", () => {
+    const noPartial: import("../src/adapters").AgentResult = {
+      agent: "claude",
+      status: "ok",
+      structured: false,
+      response: "hi",
+      duration_ms: 100,
+      timestamp: new Date().toISOString(),
+    };
+
+    expect(noPartial.partial_response).toBeUndefined();
+    expect(noPartial.partial_recommendation).toBeUndefined();
   });
 });
