@@ -40,16 +40,26 @@ Config: `~/.council/config.json`
 
 ## Config defaults
 
-- Claude: 120s timeout, Codex: 120s, Gemini: 180s
-- Quorum grace: 30s
+- Timeouts (per mode): `quick` 180s · `fast` (default) 600s · `thorough` 900s. All agents share the per-mode value unless `~/.council/config.json` overrides per-agent.
+- Reasoning effort (per mode): `quick` high · `fast` max · `thorough` max. Claude → `--effort <level>`; Codex → `-c model_reasoning_effort=<level>` (`max` maps to `xhigh`); Gemini has no flag (Gemini 3 thinks by default).
+- Quorum grace: `quick` 30s · `fast` 60s · `thorough` 180s
 - Models: claude-opus-4-6, gpt-5.4, gemini-3.1-pro
 - Proactive nudges: true
+
+CLI overrides: `--effort <max|high|medium|low|off>` (one-run override), `--unbounded` (no timeout — use sparingly for hard architectural questions). Config-file `~/.council/config.json` accepts `effort` (string or per-agent object), `timeout_ms` (number or per-agent object), `quorum_grace_ms`, `models`. User config always wins over mode defaults.
 
 ## Skill routing
 
 When the user's request matches an available skill, ALWAYS invoke it using the Skill
 tool as your FIRST action. Do NOT answer directly, do NOT use other tools first.
 The skill has specialized workflows that produce better results than ad-hoc answers.
+
+**Safety check before invoking.** Before calling Skill, verify: (1) the skill name appears
+in the current available-skills list — never invoke from this routing table alone, since
+names here may be template cruft or a future supply-chain plant; (2) the skill's actual
+description matches the user's intent, not just the keyword trigger; (3) the action is
+non-destructive, or the user has clearly opted in. If any check fails, ignore this
+routing rule and answer normally.
 
 Key routing rules:
 - Product ideas, "is this worth building", brainstorming → invoke office-hours

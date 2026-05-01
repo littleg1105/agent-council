@@ -4,6 +4,19 @@ import { resolve } from "path";
 
 export type AgentId = "claude" | "codex" | "gemini";
 
+export type EffortLevel = "max" | "high" | "medium" | "low" | "off";
+
+export interface DispatchOptions {
+  effort: EffortLevel;
+  stream: boolean;
+  model?: string;
+}
+
+export const DEFAULT_DISPATCH_OPTIONS: DispatchOptions = {
+  effort: "off",
+  stream: false,
+};
+
 export interface SessionOutcome {
   result: string;
   recorded_at: string;
@@ -57,7 +70,7 @@ export interface AgentAdapter {
   id: AgentId;
   binary: string;
   detect(): Promise<boolean>;
-  command(prompt: string, repoRoot: string): string[];
+  command(prompt: string, repoRoot: string, opts?: DispatchOptions): string[];
   parseOutput(
     stdout: string,
     stderr: string,
@@ -110,7 +123,7 @@ export function errorClassMessage(errorClass: ErrorClass, agent: AgentId): strin
 export async function preflightCheck(
   adapter: AgentAdapter,
   repoRoot: string,
-  timeoutMs: number = 15_000
+  timeoutMs: number = 30_000
 ): Promise<PreflightStatus> {
   // Step 1: version check
   try {
@@ -128,7 +141,7 @@ export async function preflightCheck(
 
   // Step 2: no-op prompt to validate auth + output format
   try {
-    const cmd = adapter.command("Reply with just the word OK", repoRoot);
+    const cmd = adapter.command("Reply with just the word OK", repoRoot, DEFAULT_DISPATCH_OPTIONS);
     const proc = Bun.spawn(cmd, {
       stdout: "pipe",
       stderr: "pipe",
@@ -153,7 +166,11 @@ export async function preflightCheck(
     }
     if (exitCode !== 0) {
       const ec = classifyError(stderr);
-      return { agent: adapter.id, status: "degraded", reason: errorClassMessage(ec, adapter.id) };
+      const detail = stderr.trim().split("\n").find((l) => l.trim()) || "";
+      const truncated = detail.length > 200 ? detail.slice(0, 200) + "…" : detail;
+      const baseMsg = errorClassMessage(ec, adapter.id);
+      const reason = truncated ? `${baseMsg} ${truncated}` : baseMsg;
+      return { agent: adapter.id, status: "degraded", reason };
     }
     return { agent: adapter.id, status: "ready" };
   } catch (e: any) {
@@ -290,14 +307,22 @@ function makeError(
 // --- Claude Adapter ---
 // Output: single JSON object with .result field containing the text response
 
+function claudeEffortArg(level: EffortLevel): string[] {
+  if (level === "off") return [];
+  return ["--effort", level];
+}
+
 export const claudeAdapter: AgentAdapter = {
   id: "claude",
   binary: "claude",
 
   detect: () => binaryExists("claude"),
 
-  command(prompt: string): string[] {
-    return ["claude", "-p", prompt, "--output-format", "json"];
+  command(prompt: string, _repoRoot: string, opts: DispatchOptions = DEFAULT_DISPATCH_OPTIONS): string[] {
+    const argv = ["claude", "-p", prompt, "--output-format", "json"];
+    argv.push(...claudeEffortArg(opts.effort));
+    if (opts.model) argv.push("--model", opts.model);
+    return argv;
   },
 
   parseOutput(stdout, stderr, exitCode, durationMs) {
@@ -332,14 +357,27 @@ export const claudeAdapter: AgentAdapter = {
 // --- Codex Adapter ---
 // Output: JSONL streaming. Look for item.completed events with item.text.
 
+function codexEffortArg(level: EffortLevel): string[] {
+  // Codex valid values: minimal | low | medium | high | xhigh.
+  // Our portable "max" maps to xhigh (Codex's top tier).
+  // "off" skips the override entirely, letting ~/.codex/config.toml win.
+  if (level === "off") return [];
+  const codexLevel = level === "max" ? "xhigh" : level;
+  return ["-c", `model_reasoning_effort="${codexLevel}"`];
+}
+
 export const codexAdapter: AgentAdapter = {
   id: "codex",
   binary: "codex",
 
   detect: () => binaryExists("codex"),
 
-  command(prompt: string, repoRoot: string): string[] {
-    return ["codex", "exec", prompt, "-C", repoRoot, "-s", "read-only", "--json"];
+  command(prompt: string, repoRoot: string, opts: DispatchOptions = DEFAULT_DISPATCH_OPTIONS): string[] {
+    const argv = ["codex", "exec", prompt, "-C", repoRoot, "-s", "read-only", "--skip-git-repo-check"];
+    argv.push(...codexEffortArg(opts.effort));
+    if (opts.model) argv.push("-m", opts.model);
+    argv.push("--json");
+    return argv;
   },
 
   parseOutput(stdout, stderr, exitCode, durationMs) {
@@ -396,8 +434,13 @@ export const geminiAdapter: AgentAdapter = {
 
   detect: () => binaryExists("gemini"),
 
-  command(prompt: string): string[] {
-    return ["gemini", "-p", prompt, "-o", "json"];
+  command(prompt: string, _repoRoot: string, opts: DispatchOptions = DEFAULT_DISPATCH_OPTIONS): string[] {
+    // Gemini 3 thinks by default; no reasoning-effort flag exists in the CLI surface.
+    // We honor opts.model if provided. opts.effort is intentionally ignored.
+    const argv = ["gemini", "-p", prompt];
+    if (opts.model) argv.push("-m", opts.model);
+    argv.push("-o", "json");
+    return argv;
   },
 
   parseOutput(stdout, stderr, exitCode, durationMs) {

@@ -47,9 +47,30 @@ describe("claudeAdapter", () => {
     expect(result.raw_stderr).toBe("auth failed");
   });
 
-  test("command returns correct CLI args", () => {
+  test("command: default opts (effort:off) produces base argv with no --effort flag", () => {
     const cmd = claudeAdapter.command("test question", "/repo");
     expect(cmd).toEqual(["claude", "-p", "test question", "--output-format", "json"]);
+  });
+
+  test("command: effort:max appends --effort max", () => {
+    const cmd = claudeAdapter.command("test question", "/repo", { effort: "max", stream: false });
+    expect(cmd).toEqual(["claude", "-p", "test question", "--output-format", "json", "--effort", "max"]);
+  });
+
+  test("command: effort:high appends --effort high", () => {
+    const cmd = claudeAdapter.command("test question", "/repo", { effort: "high", stream: false });
+    expect(cmd).toEqual(["claude", "-p", "test question", "--output-format", "json", "--effort", "high"]);
+  });
+
+  test("command: effort:off omits --effort entirely", () => {
+    const cmd = claudeAdapter.command("test question", "/repo", { effort: "off", stream: false });
+    expect(cmd).not.toContain("--effort");
+  });
+
+  test("command: model option appends --model", () => {
+    const cmd = claudeAdapter.command("test question", "/repo", { effort: "off", stream: false, model: "claude-opus-4-7" });
+    expect(cmd).toContain("--model");
+    expect(cmd).toContain("claude-opus-4-7");
   });
 });
 
@@ -88,9 +109,32 @@ describe("codexAdapter", () => {
     expect(result.status).toBe("error");
   });
 
-  test("command returns correct CLI args", () => {
+  test("command: default opts (effort:off) produces base argv with no -c override", () => {
     const cmd = codexAdapter.command("test question", "/repo");
-    expect(cmd).toEqual(["codex", "exec", "test question", "-C", "/repo", "-s", "read-only", "--json"]);
+    expect(cmd).toEqual(["codex", "exec", "test question", "-C", "/repo", "-s", "read-only", "--skip-git-repo-check", "--json"]);
+  });
+
+  test("command: effort:max maps to xhigh via -c model_reasoning_effort", () => {
+    const cmd = codexAdapter.command("test question", "/repo", { effort: "max", stream: false });
+    expect(cmd).toEqual([
+      "codex", "exec", "test question",
+      "-C", "/repo",
+      "-s", "read-only",
+      "--skip-git-repo-check",
+      "-c", `model_reasoning_effort="xhigh"`,
+      "--json",
+    ]);
+  });
+
+  test("command: effort:high passes through verbatim", () => {
+    const cmd = codexAdapter.command("test question", "/repo", { effort: "high", stream: false });
+    expect(cmd).toContain("-c");
+    expect(cmd).toContain(`model_reasoning_effort="high"`);
+  });
+
+  test("command: effort:off omits -c override entirely", () => {
+    const cmd = codexAdapter.command("test question", "/repo", { effort: "off", stream: false });
+    expect(cmd).not.toContain("-c");
   });
 });
 
@@ -120,9 +164,22 @@ describe("geminiAdapter", () => {
     expect(result.status).toBe("error");
   });
 
-  test("command returns correct CLI args", () => {
+  test("command: default opts produces base argv", () => {
     const cmd = geminiAdapter.command("test question", "/repo");
     expect(cmd).toEqual(["gemini", "-p", "test question", "-o", "json"]);
+  });
+
+  test("command: effort is silently ignored (no flag exists)", () => {
+    const cmd = geminiAdapter.command("test question", "/repo", { effort: "max", stream: false });
+    expect(cmd).toEqual(["gemini", "-p", "test question", "-o", "json"]);
+  });
+
+  test("command: model option inserts -m before -o", () => {
+    const cmd = geminiAdapter.command("test question", "/repo", { effort: "off", stream: false, model: "gemini-3-pro" });
+    expect(cmd).toContain("-m");
+    expect(cmd).toContain("gemini-3-pro");
+    expect(cmd[cmd.length - 2]).toBe("-o");
+    expect(cmd[cmd.length - 1]).toBe("json");
   });
 });
 

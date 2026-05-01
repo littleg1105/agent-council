@@ -8,6 +8,9 @@ import {
   type SessionMeta,
   type PreflightStatus,
   type ErrorClass,
+  type DispatchOptions,
+  type EffortLevel,
+  DEFAULT_DISPATCH_OPTIONS,
   detectAgents,
   allAdapters,
   classifyError,
@@ -19,18 +22,27 @@ import { generateViewer } from "./viewer";
 
 // --- Types ---
 
+type CouncilMode = "fast" | "thorough" | "quick";
+
 interface CouncilConfig {
   models: Record<string, string>;
   timeout_ms: Record<string, number>;
   quorum_grace_ms: number;
+  effort: Record<string, EffortLevel>;
 }
 
 // --- Config ---
 
 const DEFAULT_TIMEOUTS: Record<string, number> = {
-  claude: 120_000,
-  codex: 120_000,
-  gemini: 180_000,
+  claude: 600_000,
+  codex: 600_000,
+  gemini: 600_000,
+};
+
+const DEFAULT_EFFORT: Record<string, EffortLevel> = {
+  claude: "max",
+  codex: "max",
+  gemini: "max",
 };
 
 const DEFAULT_CONFIG: CouncilConfig = {
@@ -40,8 +52,51 @@ const DEFAULT_CONFIG: CouncilConfig = {
     gemini: "gemini-3.1-pro",
   },
   timeout_ms: { ...DEFAULT_TIMEOUTS },
-  quorum_grace_ms: 30_000,
+  quorum_grace_ms: 60_000,
+  effort: { ...DEFAULT_EFFORT },
 };
+
+// Effective unbounded for setTimeout (it clamps signed-int32 max).
+const UNBOUNDED_TIMEOUT_MS = 2_147_483_647;
+
+const VALID_EFFORT_LEVELS: ReadonlyArray<EffortLevel> = ["max", "high", "medium", "low", "off"];
+
+function isEffortLevel(v: any): v is EffortLevel {
+  return typeof v === "string" && (VALID_EFFORT_LEVELS as readonly string[]).includes(v);
+}
+
+interface ModePreset {
+  effort: EffortLevel;
+  timeouts: Record<string, number>;
+  grace_ms: number;
+}
+
+function modeDefaults(mode: CouncilMode): ModePreset {
+  // Grace defaults equal timeouts: once quorum is reached, every still-pending agent
+  // gets its full per-agent timeout. The grace clamp in dispatchWithQuorum will extend
+  // further if user config sets a longer per-agent timeout.
+  switch (mode) {
+    case "quick":
+      return {
+        effort: "high",
+        timeouts: { claude: 180_000, codex: 180_000, gemini: 180_000 },
+        grace_ms: 180_000,
+      };
+    case "thorough":
+      return {
+        effort: "max",
+        timeouts: { claude: 900_000, codex: 900_000, gemini: 900_000 },
+        grace_ms: 900_000,
+      };
+    case "fast":
+    default:
+      return {
+        effort: "max",
+        timeouts: { claude: 600_000, codex: 600_000, gemini: 600_000 },
+        grace_ms: 600_000,
+      };
+  }
+}
 
 function councilHome(): string {
   const home = resolve(homedir(), ".council");
@@ -56,33 +111,75 @@ function councilHome(): string {
   }
 }
 
-function loadConfig(): CouncilConfig {
+interface RawConfig {
+  models?: Record<string, string>;
+  timeout_ms?: number | Record<string, number>;
+  quorum_grace_ms?: number;
+  effort?: EffortLevel | Partial<Record<string, EffortLevel>>;
+}
+
+function rawConfigOnDisk(): RawConfig {
   const configPath = resolve(councilHome(), "config.json");
-  if (!existsSync(configPath)) return DEFAULT_CONFIG;
-
+  if (!existsSync(configPath)) return {};
   try {
-    const raw = readFileSync(configPath, "utf-8");
-    const parsed = JSON.parse(raw);
-
-    // timeout_ms can be a number (applied to all) or per-agent object
-    let timeouts = { ...DEFAULT_TIMEOUTS };
-    if (parsed.timeout_ms) {
-      if (typeof parsed.timeout_ms === "number") {
-        timeouts = { claude: parsed.timeout_ms, codex: parsed.timeout_ms, gemini: parsed.timeout_ms };
-      } else if (typeof parsed.timeout_ms === "object") {
-        timeouts = { ...DEFAULT_TIMEOUTS, ...parsed.timeout_ms };
-      }
-    }
-
-    return {
-      models: { ...DEFAULT_CONFIG.models, ...(parsed.models || {}) },
-      timeout_ms: timeouts,
-      quorum_grace_ms: parsed.quorum_grace_ms || DEFAULT_CONFIG.quorum_grace_ms,
-    };
+    return JSON.parse(readFileSync(configPath, "utf-8"));
   } catch (e: any) {
     console.error(`Warning: Failed to parse ${configPath}: ${e.message}. Using defaults.`);
-    return DEFAULT_CONFIG;
+    return {};
   }
+}
+
+function mergeConfig(parsed: RawConfig, base: CouncilConfig): CouncilConfig {
+  // timeout_ms: number → all agents; object → per-agent override
+  let timeouts = { ...base.timeout_ms };
+  if (parsed.timeout_ms !== undefined) {
+    if (typeof parsed.timeout_ms === "number") {
+      timeouts = { claude: parsed.timeout_ms, codex: parsed.timeout_ms, gemini: parsed.timeout_ms };
+    } else if (typeof parsed.timeout_ms === "object" && parsed.timeout_ms !== null) {
+      timeouts = { ...base.timeout_ms, ...parsed.timeout_ms };
+    }
+  }
+
+  // effort: string → all agents; object → per-agent override
+  let effort = { ...base.effort };
+  if (parsed.effort !== undefined) {
+    if (typeof parsed.effort === "string") {
+      if (!isEffortLevel(parsed.effort)) {
+        console.error(`Warning: invalid effort value "${parsed.effort}". Using default.`);
+      } else {
+        effort = { claude: parsed.effort, codex: parsed.effort, gemini: parsed.effort };
+      }
+    } else if (typeof parsed.effort === "object" && parsed.effort !== null) {
+      const next: Record<string, EffortLevel> = { ...base.effort };
+      for (const [agent, value] of Object.entries(parsed.effort)) {
+        if (isEffortLevel(value)) {
+          next[agent] = value;
+        } else {
+          console.error(`Warning: invalid effort value "${value}" for ${agent}. Ignoring.`);
+        }
+      }
+      effort = next;
+    }
+  }
+
+  return {
+    models: { ...base.models, ...(parsed.models || {}) },
+    timeout_ms: timeouts,
+    quorum_grace_ms: parsed.quorum_grace_ms || base.quorum_grace_ms,
+    effort,
+  };
+}
+
+function loadConfig(mode: CouncilMode = "fast"): CouncilConfig {
+  // Layer order: built-in DEFAULT_CONFIG  <  mode preset  <  user config.json
+  const preset = modeDefaults(mode);
+  const presetBase: CouncilConfig = {
+    ...DEFAULT_CONFIG,
+    timeout_ms: { ...preset.timeouts },
+    quorum_grace_ms: preset.grace_ms,
+    effort: { claude: preset.effort, codex: preset.effort, gemini: preset.effort },
+  };
+  return mergeConfig(rawConfigOnDisk(), presetBase);
 }
 
 // --- Subprocess dispatch ---
@@ -91,15 +188,18 @@ async function dispatchAgent(
   adapter: AgentAdapter,
   prompt: string,
   repoRoot: string,
-  timeoutMs: number
+  timeoutMs: number,
+  opts: DispatchOptions = DEFAULT_DISPATCH_OPTIONS,
+  procRef?: { proc: ReturnType<typeof Bun.spawn> | null }
 ): Promise<AgentResult> {
   const startTime = Date.now();
-  const cmd = adapter.command(prompt, repoRoot);
+  const cmd = adapter.command(prompt, repoRoot, opts);
   const proc = Bun.spawn(cmd, {
     stdout: "pipe",
     stderr: "pipe",
     cwd: repoRoot,
   });
+  if (procRef) procRef.proc = proc;
 
   let timedOut = false;
   let killTimer: ReturnType<typeof setTimeout> | null = null;
@@ -163,9 +263,11 @@ async function dispatchAgentWithRetry(
   prompt: string,
   repoRoot: string,
   timeoutMs: number,
-  retries: number = 1
+  opts: DispatchOptions = DEFAULT_DISPATCH_OPTIONS,
+  retries: number = 1,
+  procRef?: { proc: ReturnType<typeof Bun.spawn> | null }
 ): Promise<AgentResult> {
-  const result = await dispatchAgent(adapter, prompt, repoRoot, timeoutMs);
+  const result = await dispatchAgent(adapter, prompt, repoRoot, timeoutMs, opts, procRef);
   if (result.status === "ok" || retries <= 0) return result;
 
   // Only retry transient failures
@@ -174,7 +276,7 @@ async function dispatchAgentWithRetry(
 
   console.error(`  ${adapter.id} failed (${ec}). Retrying in 3s...`);
   await new Promise((r) => setTimeout(r, 3000));
-  return dispatchAgent(adapter, prompt, repoRoot, timeoutMs);
+  return dispatchAgent(adapter, prompt, repoRoot, timeoutMs, opts, procRef);
 }
 
 // --- Stage 1: Independent Opinions (with quorum + grace window) ---
@@ -184,6 +286,7 @@ async function dispatchWithQuorum(
   prompt: string,
   repoRoot: string,
   timeouts: Record<string, number>,
+  effortByAgent: Record<string, EffortLevel>,
   gracePeriodMs: number,
   stageName: string,
   retries: number = 1
@@ -192,11 +295,24 @@ async function dispatchWithQuorum(
 
   console.error(`Dispatching ${stageName} to ${members.length} agents in parallel...`);
   for (const m of members) {
-    console.error(`  - ${m.id} (timeout: ${(timeouts[m.id] || 120000) / 1000}s)`);
+    const t = (timeouts[m.id] || 120_000) / 1000;
+    const eff = effortByAgent[m.id] || "off";
+    const tDisplay = timeouts[m.id] === UNBOUNDED_TIMEOUT_MS ? "unbounded" : `${t}s`;
+    console.error(`  - ${m.id} (timeout: ${tDisplay}, effort: ${eff})`);
+  }
+
+  // Quorum grace must never cut an agent below its own remaining timeout budget.
+  // If grace would expire before the slowest pending agent's per-agent timeout, extend it.
+  const maxAgentTimeout = Math.max(...members.map((m) => timeouts[m.id] || 120_000));
+  const effectiveGraceMs = Math.max(gracePeriodMs, maxAgentTimeout);
+  if (effectiveGraceMs !== gracePeriodMs) {
+    console.error(`  (quorum grace extended to ${(effectiveGraceMs / 1000).toFixed(0)}s to honor per-agent timeouts)`);
   }
 
   // Track results as they arrive
   const results: (AgentResult | null)[] = new Array(members.length).fill(null);
+  // Per-agent subprocess refs so we can SIGTERM orphans on grace expiry
+  const procRefs: { proc: ReturnType<typeof Bun.spawn> | null }[] = members.map(() => ({ proc: null }));
   let successCount = 0;
   let completedCount = 0;
   let graceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -209,6 +325,19 @@ async function dispatchWithQuorum(
       resolved = true;
       if (graceTimer) clearTimeout(graceTimer);
       console.error(`  ${reason}`);
+
+      // SIGTERM any still-running children so they don't orphan-write to closed pipes.
+      // (Council session council-20260501-125017 caught this bug live.)
+      for (let i = 0; i < members.length; i++) {
+        if (results[i]) continue;
+        const ref = procRefs[i];
+        if (ref?.proc) {
+          try {
+            ref.proc.kill("SIGTERM");
+            console.error(`    ${members[i].id}: SIGTERM (orphan kill)`);
+          } catch {}
+        }
+      }
 
       // Fill in any still-pending agents as timeouts
       const final = results.map((r, i) => {
@@ -228,7 +357,11 @@ async function dispatchWithQuorum(
 
     members.forEach((adapter, i) => {
       const agentTimeout = timeouts[adapter.id] || 120_000;
-      dispatchAgentWithRetry(adapter, prompt, repoRoot, agentTimeout, retries).then((result) => {
+      const agentOpts: DispatchOptions = {
+        effort: effortByAgent[adapter.id] || "off",
+        stream: false,
+      };
+      dispatchAgentWithRetry(adapter, prompt, repoRoot, agentTimeout, agentOpts, retries, procRefs[i]).then((result) => {
         results[i] = result;
         completedCount++;
         if (result.status === "ok") {
@@ -252,10 +385,10 @@ async function dispatchWithQuorum(
         // Quorum reached, start grace window for stragglers
         if (successCount >= quorum && !graceTimer && !resolved) {
           const remaining = members.length - completedCount;
-          console.error(`  Quorum reached (${successCount}/${members.length}). Giving stragglers ${gracePeriodMs / 1000}s grace...`);
+          console.error(`  Quorum reached (${successCount}/${members.length}). Giving stragglers ${(effectiveGraceMs / 1000).toFixed(0)}s grace...`);
           graceTimer = setTimeout(() => {
             tryResolve(`Grace period expired. ${remaining} agent(s) still pending.`);
-          }, gracePeriodMs);
+          }, effectiveGraceMs);
         }
       });
     });
@@ -268,10 +401,11 @@ async function runStage1(
   context: string,
   repoRoot: string,
   timeouts: Record<string, number>,
+  effortByAgent: Record<string, EffortLevel>,
   gracePeriodMs: number
 ): Promise<AgentResult[]> {
   const prompt = stage1Prompt(question, context);
-  return dispatchWithQuorum(members, prompt, repoRoot, timeouts, gracePeriodMs, "Stage 1");
+  return dispatchWithQuorum(members, prompt, repoRoot, timeouts, effortByAgent, gracePeriodMs, "Stage 1");
 }
 
 // --- Stage 2: Anonymized Peer Review ---
@@ -298,11 +432,12 @@ async function runStage2(
   opinions: AgentResult[],
   repoRoot: string,
   timeouts: Record<string, number>,
+  effortByAgent: Record<string, EffortLevel>,
   gracePeriodMs: number
 ): Promise<AgentResult[]> {
   const { anonymized } = anonymizeOpinions(opinions);
   const prompt = stage2Prompt(question, anonymized);
-  return dispatchWithQuorum(members, prompt, repoRoot, timeouts, gracePeriodMs, "Stage 2", 0);
+  return dispatchWithQuorum(members, prompt, repoRoot, timeouts, effortByAgent, gracePeriodMs, "Stage 2", 0);
 }
 
 // --- Storage ---
@@ -490,6 +625,7 @@ async function revisitSession(
     context,
     repoRoot,
     config.timeout_ms,
+    config.effort,
     config.quorum_grace_ms
   );
 
@@ -637,13 +773,17 @@ async function runNudge(
   // Build Stage 4 prompt
   const prompt = stage4NudgePrompt(meta.question, originalOpinion.response, correction);
   const agentTimeout = config.timeout_ms[targetAgent] || 120_000;
+  const nudgeOpts: DispatchOptions = {
+    effort: config.effort[targetAgent] || "off",
+    stream: false,
+  };
 
   console.error(`\nNudging ${targetAgent} with correction...`);
   console.error(`  Original recommendation: ${originalOpinion.recommendation?.slice(0, 80) || "(unstructured)"}...`);
   console.error(`  Correction: ${correction.slice(0, 100)}${correction.length > 100 ? "..." : ""}`);
 
   // Dispatch (no retry for nudge — user can re-run manually)
-  const result = await dispatchAgent(adapter, prompt, repoRoot, agentTimeout);
+  const result = await dispatchAgent(adapter, prompt, repoRoot, agentTimeout, nudgeOpts);
 
   // Save nudge result
   const stage4Dir = resolve(sessionDir, "stage4");
@@ -687,20 +827,22 @@ function parseArgs(): {
   chairman: AgentId;
   questionFile?: string;
   project: string;
-  mode: "fast" | "thorough" | "quick";
+  mode: CouncilMode;
   contextFiles: string[];
   sessionId?: string;
   outcomeResult?: string;
   skipPreflight: boolean;
   nudgeAgent?: AgentId;
   nudgeCorrection?: string;
+  effortOverride?: EffortLevel;
+  unbounded: boolean;
 } {
   const args = process.argv.slice(2);
 
   // Subcommands
   if (args[0] === "list") {
     const project = getFlag(args, "--project") || detectProjectSlug();
-    return { command: "list", chairman: detectChairman(), project, mode: "fast", contextFiles: [], skipPreflight: true };
+    return { command: "list", chairman: detectChairman(), project, mode: "fast", contextFiles: [], skipPreflight: true, unbounded: false };
   }
   if (args[0] === "replay") {
     const sessionId = args[1];
@@ -717,6 +859,7 @@ function parseArgs(): {
       contextFiles: [],
       sessionId,
       skipPreflight: true,
+      unbounded: false,
     };
   }
   if (args[0] === "revisit") {
@@ -737,6 +880,7 @@ function parseArgs(): {
       contextFiles,
       sessionId,
       skipPreflight: true,
+      unbounded: false,
     };
   }
   if (args[0] === "regenerate-viewer") {
@@ -754,6 +898,7 @@ function parseArgs(): {
       contextFiles: [],
       sessionId,
       skipPreflight: true,
+      unbounded: false,
     };
   }
   if (args[0] === "outcome") {
@@ -777,6 +922,7 @@ function parseArgs(): {
       sessionId,
       outcomeResult: result,
       skipPreflight: true,
+      unbounded: false,
     };
   }
 
@@ -798,6 +944,9 @@ function parseArgs(): {
       process.exit(1);
     }
     const project = getFlag(args, "--project") || detectProjectSlug();
+    const effortFlagN = getFlag(args, "--effort");
+    const effortOverrideN = effortFlagN && isEffortLevel(effortFlagN) ? effortFlagN as EffortLevel : undefined;
+    const unboundedN = args.includes("--unbounded");
     return {
       command: "nudge",
       chairman: detectChairman(),
@@ -808,6 +957,8 @@ function parseArgs(): {
       skipPreflight: false,
       nudgeAgent: nudgeAgent as AgentId,
       nudgeCorrection,
+      effortOverride: effortOverrideN,
+      unbounded: unboundedN,
     };
   }
 
@@ -828,7 +979,27 @@ function parseArgs(): {
   }
 
   const skipPreflight = args.includes("--skip-preflight");
-  return { command: "run", chairman, questionFile, project, mode, contextFiles, skipPreflight };
+  const effortFlag = getFlag(args, "--effort");
+  let effortOverride: EffortLevel | undefined;
+  if (effortFlag !== undefined) {
+    if (!isEffortLevel(effortFlag)) {
+      console.error(`Error: invalid --effort value "${effortFlag}". Must be one of: ${VALID_EFFORT_LEVELS.join(", ")}`);
+      process.exit(1);
+    }
+    effortOverride = effortFlag;
+  }
+  const unbounded = args.includes("--unbounded");
+  return {
+    command: "run",
+    chairman,
+    questionFile,
+    project,
+    mode,
+    contextFiles,
+    skipPreflight,
+    effortOverride,
+    unbounded,
+  };
 }
 
 function getFlag(args: string[], flag: string): string | undefined {
@@ -954,9 +1125,34 @@ export function buildContextBundle(files: string[], repoRoot: string): string {
 
 // --- Main ---
 
+function applyOverrides(
+  config: CouncilConfig,
+  effortOverride: EffortLevel | undefined,
+  unbounded: boolean
+): CouncilConfig {
+  const next: CouncilConfig = {
+    models: { ...config.models },
+    timeout_ms: { ...config.timeout_ms },
+    quorum_grace_ms: config.quorum_grace_ms,
+    effort: { ...config.effort },
+  };
+  if (effortOverride) {
+    next.effort = { claude: effortOverride, codex: effortOverride, gemini: effortOverride };
+  }
+  if (unbounded) {
+    next.timeout_ms = {
+      claude: UNBOUNDED_TIMEOUT_MS,
+      codex: UNBOUNDED_TIMEOUT_MS,
+      gemini: UNBOUNDED_TIMEOUT_MS,
+    };
+  }
+  return next;
+}
+
 async function main(): Promise<void> {
   const parsed = parseArgs();
-  const config = loadConfig();
+  let config = loadConfig(parsed.mode);
+  config = applyOverrides(config, parsed.effortOverride, parsed.unbounded);
 
   // Handle subcommands
   if (parsed.command === "list") {
@@ -1074,6 +1270,7 @@ async function main(): Promise<void> {
     context,
     repoRoot,
     config.timeout_ms,
+    config.effort,
     config.quorum_grace_ms
   );
 
@@ -1121,6 +1318,7 @@ async function main(): Promise<void> {
       successfulOpinions,
       repoRoot,
       config.timeout_ms,
+      config.effort,
       config.quorum_grace_ms
     );
 
