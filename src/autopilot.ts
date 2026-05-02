@@ -43,6 +43,14 @@ import { spawnImplementingClaude, getCurrentCommit } from "./autopilot-spawn";
 import { verifyInWorktree, verifySpecSha, type VerifyResult } from "./autopilot-verifier";
 import { installPreCommitHook, uninstallPreCommitHook } from "./autopilot-hook";
 import {
+  computeFailureSignature,
+  detectStuck,
+  getTreeHash,
+  type FailureSignature,
+  type StuckHistory,
+  type StuckTrigger,
+} from "./autopilot-stuck";
+import {
   defaultState,
   fileHash,
   goalId,
@@ -570,6 +578,8 @@ async function runLiveMode(args: {
   repoRoot: string;
   profile: ProjectProfile;
   userGoalText: string;
+  /** Council binary path. Auto-detected by caller; passed through for testability. */
+  councilBin: string;
 }): Promise<LiveResult> {
   // Install the pre-commit hook (load-bearing frozen-spec defense).
   const hookResult = installPreCommitHook(args.repoRoot);
@@ -607,6 +617,7 @@ async function runLiveMode(args: {
       repoRoot: args.repoRoot,
       profile: args.profile,
       userGoalText: args.userGoalText,
+      councilBin: args.councilBin,
     });
 
     if (result === "rate_limited") {
@@ -659,12 +670,20 @@ async function runLeafGoal(args: {
   repoRoot: string;
   profile: ProjectProfile;
   userGoalText: string;
+  /** Council binary for stuck-rescue dispatches (PR9.2). */
+  councilBin: string;
 }): Promise<"done" | "failed" | "rate_limited"> {
   args.goal.status = "in_progress";
   args.state.current_goal_id = args.goal.id;
   await writeState(args.autopilotDir, args.state);
 
   let previous: PreviousIterationContext | null = null;
+  // Per-goal stuck-detection history (PR9.2 — Fork 3C).
+  const history: StuckHistory = {
+    signatures: [],
+    treeHashes: [],
+    lastGreenAt: args.state.last_progress_at,  // start counting from last orchestrator-level progress
+  };
 
   while (args.goal.iteration < LIVE_MAX_ITERATIONS_PER_GOAL) {
     args.goal.iteration += 1;
@@ -739,21 +758,254 @@ async function runLeafGoal(args: {
       return "done";
     }
 
-    console.error(`[autopilot]     ✗ verifier failed (exit ${verify.exitCode}, ${verify.durationMs}ms); next iteration`);
+    console.error(`[autopilot]     ✗ verifier failed (exit ${verify.exitCode}, ${verify.durationMs}ms); checking stuck heuristic`);
     previous = {
       iteration: args.goal.iteration,
       failingTestsOutput: verify.stdout,
       verifierStderr: verify.stderr,
       verifierExitCode: verify.exitCode,
     };
+
+    // PR9.2: Stuck detection (Fork 3C — weighted heuristic).
+    history.signatures.push(computeFailureSignature(verify, args.profile));
+    history.treeHashes.push(await getTreeHash(args.repoRoot));
+    args.goal.last_test_hash = history.signatures[history.signatures.length - 1].normalizedOutputHash;
+
+    const stuck = detectStuck(history);
+    if (stuck.stuck) {
+      console.error(`[autopilot]     ⚠ STUCK detected: ${stuck.reason}`);
+      const rescueOutcome = await runStuckRescue({
+        goal: args.goal,
+        state: args.state,
+        autopilotDir: args.autopilotDir,
+        repoRoot: args.repoRoot,
+        profile: args.profile,
+        userGoalText: args.userGoalText,
+        councilBin: args.councilBin,
+        trigger: stuck,
+        history,
+        latestVerify: verify,
+      });
+      if (rescueOutcome === "rescued") {
+        // Council provided guidance; reset stuck history (one rescue per goal).
+        // The rescue notes are already in .autopilot/notes/<id>-rescue.md;
+        // the implementing claude will read them via AUTOPILOT.md context.
+        history.signatures = [];
+        history.treeHashes = [];
+        history.lastGreenAt = new Date().toISOString();
+        console.error(`[autopilot]     ↪ rescue council guidance written; continuing with reset stuck history`);
+      } else {
+        // Rescue exhausted (already used 1) OR rescue council itself failed.
+        // Roll back to last_green_commit and mark failed.
+        if (args.state.last_green_commit) {
+          console.error(`[autopilot]     ↩ rolling back to last green commit ${args.state.last_green_commit.slice(0, 8)}`);
+          await rollbackToCommit(args.repoRoot, args.state.last_green_commit);
+        }
+        args.goal.status = "failed";
+        args.goal.failure_reason = `stuck (${stuck.reason}); rescue council exhausted; rolled back to ${args.state.last_green_commit?.slice(0, 8) ?? "(no green commit)"}`;
+        await appendFailedGoalsLog(args.repoRoot, args.goal, args.goal.failure_reason);
+        await writeState(args.autopilotDir, args.state);
+        return "failed";
+      }
+    }
     await writeState(args.autopilotDir, args.state);  // persist iteration count
   }
 
-  // Iteration cap exhausted. PR9.2 will spawn a stuck-rescue council here.
+  // Iteration cap exhausted (no rescue triggered earlier). Roll back + fail.
+  if (args.state.last_green_commit) {
+    console.error(`[autopilot]     ↩ iteration cap; rolling back to last green ${args.state.last_green_commit.slice(0, 8)}`);
+    await rollbackToCommit(args.repoRoot, args.state.last_green_commit);
+  }
   args.goal.status = "failed";
   args.goal.failure_reason = `iteration cap (${LIVE_MAX_ITERATIONS_PER_GOAL}) reached without verifier passing`;
+  await appendFailedGoalsLog(args.repoRoot, args.goal, args.goal.failure_reason);
   await writeState(args.autopilotDir, args.state);
   return "failed";
+}
+
+/* ============================================================
+ * Stuck rescue council (PR9.2)
+ * ============================================================
+ *
+ * Fork 3C policy: ONE rescue council per goal. If rescue produces
+ * concrete guidance, write it to .autopilot/notes/<id>-rescue.md and
+ * let the implementing claude continue. If rescue is already used, OR
+ * the council itself fails, roll back to last_green_commit, mark goal
+ * failed, append to FAILED_GOALS.md, advance.
+ */
+
+async function runStuckRescue(args: {
+  goal: Goal;
+  state: AutopilotState;
+  autopilotDir: string;
+  repoRoot: string;
+  profile: ProjectProfile;
+  userGoalText: string;
+  councilBin: string;
+  trigger: StuckTrigger;
+  history: StuckHistory;
+  latestVerify: VerifyResult;
+}): Promise<"rescued" | "exhausted"> {
+  if (args.goal.stuck_rescues_used >= 1) {
+    console.error(`[autopilot]     stuck-rescue already used for ${args.goal.id}; not retrying`);
+    return "exhausted";
+  }
+  args.goal.stuck_rescues_used += 1;
+  await writeState(args.autopilotDir, args.state);
+
+  // Build rescue prompt: facts, what's failed, what to recommend.
+  const triggerStr = !args.trigger.stuck ? "(not stuck — internal bug)" :
+    args.trigger.reason === "same_failure_with_git_advance" ? `Same failure across ${args.trigger.iterations} iterations while git advanced.` :
+    args.trigger.reason === "no_green_for_30min" ? `${args.trigger.minutesElapsed} minutes without a red→green transition.` :
+    "Tree hash unchanged across 3 cycles (claude not making commits).";
+  const lastSig = args.history.signatures[args.history.signatures.length - 1];
+  const failingIdsList = lastSig.failingTestIds.length > 0
+    ? lastSig.failingTestIds.slice(0, 10).map((s) => `  - ${s}`).join("\n")
+    : "(no extractable failing test ids; output may be malformed)";
+
+  const goalFile = resolve(args.autopilotDir, "goals", `${args.goal.id}.md`);
+  const specFile = resolve(args.repoRoot, args.goal.spec_file);
+  const rescuePrompt = `The autopilot is stuck on a leaf goal. Help unblock it with concrete
+guidance — but do NOT propose changes to the frozen test spec. Specs are
+contract; the implementing claude must satisfy them, not edit them.
+
+# Stuck-rescue context
+
+Goal id: ${args.goal.id}
+Goal title: ${args.goal.title}
+Iterations attempted: ${args.goal.iteration}
+Stuck trigger: ${args.trigger.stuck ? args.trigger.reason : "(unknown)"}
+Trigger detail: ${triggerStr}
+
+Project profile: ${args.profile.display_name} (${args.profile.language})
+Verify command: ${args.profile.spec_test_command(args.goal.spec_file)}
+
+# Files relevant to this goal
+
+  - ${goalFile} (the leaf goal description)
+  - ${specFile} (FROZEN spec — do NOT propose edits to this)
+  - The implementing claude has full repo write access EXCEPT \`.council/specs/\`
+
+# Latest failing test output (verbatim, possibly truncated)
+
+\`\`\`
+${args.latestVerify.stdout.slice(0, 4000)}
+${args.latestVerify.stderr.length > 0 ? "\nstderr:\n" + args.latestVerify.stderr.slice(0, 1500) : ""}
+\`\`\`
+
+Failing test ids (last iteration):
+${failingIdsList}
+
+# What to produce
+
+1. Diagnose the most likely root cause — be SPECIFIC, cite file/line if you can.
+2. Recommend ONE next action the implementing claude should try. Concrete.
+   Not "consider X" — pick one.
+3. If you believe the spec itself is broken (genuinely impossible to satisfy
+   without spec changes), say so EXPLICITLY at the top: "SPEC IS BROKEN: ..."
+   The autopilot will fail the goal cleanly in that case.
+
+Each council member: produce a short (150-300 word) diagnosis + recommendation.
+The chairman picks the single best one. The implementing claude reads the
+chairman's recommendation and uses it as guidance for the next iteration.
+
+Do NOT propose making the test pass by changing the test. The pre-commit
+hook rejects spec edits. If the spec is wrong, say "SPEC IS BROKEN".
+`;
+
+  // Dispatch to the council
+  const sessionDir = await dispatchBootstrapCouncil({
+    councilBin: args.councilBin,
+    question: rescuePrompt,
+    repoRoot: args.repoRoot,
+  }).catch((e) => {
+    console.error(`[autopilot]     rescue council dispatch failed: ${e.message}`);
+    return null;
+  });
+  if (!sessionDir) return "exhausted";
+
+  // Lightweight synthesis: pick the longest opinion as a stand-in for
+  // chairman synthesis. The dedicated synthesizer (used in bootstrap) is
+  // overkill here — the rescue is advisory, not contract-bearing.
+  const stage1 = resolve(sessionDir, "stage1");
+  if (!existsSync(stage1)) return "exhausted";
+  let bestOpinion = "";
+  for (const id of ["claude", "codex", "gemini"]) {
+    const path = resolve(stage1, `opinion_${id}.json`);
+    if (!existsSync(path)) continue;
+    try {
+      const op = JSON.parse(readFileSync(path, "utf-8"));
+      if (op.status !== "ok" || typeof op.response !== "string") continue;
+      if (op.response.length > bestOpinion.length) bestOpinion = op.response;
+    } catch {}
+  }
+  if (!bestOpinion) return "exhausted";
+
+  // SPEC-broken short-circuit: the council can flag this explicitly.
+  if (/SPEC IS BROKEN/i.test(bestOpinion)) {
+    console.error(`[autopilot]     rescue council says SPEC IS BROKEN; failing goal cleanly`);
+    args.goal.failure_reason = `rescue council declared spec broken: ${bestOpinion.slice(0, 300)}`;
+    return "exhausted";
+  }
+
+  // Write rescue notes for the implementing claude to read via AUTOPILOT.md.
+  const notesDir = resolve(args.autopilotDir, "notes");
+  mkdirSync(notesDir, { recursive: true });
+  const notesPath = resolve(notesDir, `${args.goal.id}-rescue.md`);
+  const notesContent = `# Stuck-rescue council guidance for ${args.goal.id}
+
+The implementing claude got stuck on this goal. The orchestrator dispatched
+a rescue council; the chairman's guidance is below. Read it before your next
+iteration.
+
+**Stuck trigger:** ${args.trigger.stuck ? args.trigger.reason : "(unknown)"}
+**Iterations attempted:** ${args.goal.iteration}
+**Failing test ids (last iteration):**
+${failingIdsList}
+
+---
+
+${bestOpinion}
+
+---
+
+This is ADVISORY — you are still the implementer. The spec is still frozen.
+If you've tried the suggestion and it doesn't work, append your reasoning to
+\`.autopilot/notes/${args.goal.id}-attempts.md\` and exit.
+`;
+  writeFileSync(notesPath, notesContent, "utf-8");
+  args.goal.notes_file = `.autopilot/notes/${args.goal.id}-rescue.md`;
+  await writeState(args.autopilotDir, args.state);
+
+  console.error(`[autopilot]     rescue notes written: ${notesPath}`);
+  return "rescued";
+}
+
+async function rollbackToCommit(repoRoot: string, commit: string): Promise<void> {
+  try {
+    await Bun.spawn(["git", "reset", "--hard", commit], {
+      cwd: repoRoot,
+      stdout: "ignore",
+      stderr: "ignore",
+    }).exited;
+  } catch (e: any) {
+    console.error(`[autopilot]     rollback failed: ${e.message}`);
+  }
+}
+
+async function appendFailedGoalsLog(repoRoot: string, goal: Goal, reason: string): Promise<void> {
+  const path = resolve(repoRoot, ".autopilot", "FAILED_GOALS.md");
+  const entry = `## ${goal.id}: ${goal.title}\n\n` +
+    `**Failed at:** ${new Date().toISOString()}\n` +
+    `**Iterations:** ${goal.iteration}\n` +
+    `**Reason:** ${reason}\n` +
+    `**Spec:** \`${goal.spec_file}\`\n` +
+    `**Notes:** ${goal.notes_file ? `\`${goal.notes_file}\`` : "(none)"}\n\n` +
+    `---\n\n`;
+  try {
+    const existing = existsSync(path) ? readFileSync(path, "utf-8") : "# Failed goals\n\n";
+    writeFileSync(path, existing + entry, "utf-8");
+  } catch {}
 }
 
 /**
@@ -798,7 +1050,8 @@ async function runResume(args: CliArgs): Promise<LiveResult> {
   }
   const userGoalText = readFileSync(goalFilePath, "utf-8");
 
-  return runLiveMode({ state, autopilotDir, repoRoot: args.repoRoot, profile, userGoalText });
+  const councilBin = locateCouncilBin(args.councilBin);
+  return runLiveMode({ state, autopilotDir, repoRoot: args.repoRoot, profile, userGoalText, councilBin });
 }
 
 // Entry point. Don't run main() during test imports (matches council.ts pattern).
@@ -832,7 +1085,8 @@ async function main(): Promise<void> {
     console.error("[autopilot] Stuck detection / final-review veto / rate-limit pause are happy-path-only.");
     console.error("[autopilot] PR9.2-9.4 will harden the orchestrator against those edge cases.");
 
-    const result = await runLiveMode({ state, autopilotDir, repoRoot: args.repoRoot, profile, userGoalText });
+    const liveCouncilBin = locateCouncilBin(args.councilBin);
+    const result = await runLiveMode({ state, autopilotDir, repoRoot: args.repoRoot, profile, userGoalText, councilBin: liveCouncilBin });
 
     console.error("");
     console.error(`[autopilot] Live mode finished: ${result.status}`);
