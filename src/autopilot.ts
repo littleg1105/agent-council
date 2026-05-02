@@ -33,10 +33,15 @@ import {
 import { resolve } from "path";
 import {
   buildBootstrapPrompt,
+  buildImplementationPrompt,
   buildSynthesizerPrompt,
   parseGoalsBlock,
   type DecompositionGoal,
+  type PreviousIterationContext,
 } from "./autopilot-prompts";
+import { spawnImplementingClaude, getCurrentCommit } from "./autopilot-spawn";
+import { verifyInWorktree, verifySpecSha, type VerifyResult } from "./autopilot-verifier";
+import { installPreCommitHook, uninstallPreCommitHook } from "./autopilot-hook";
 import {
   defaultState,
   fileHash,
@@ -124,8 +129,12 @@ OPTIONS
   --goal, -g <path>        User-supplied goal markdown file (required unless --resume)
   --repo, -r <path>        Repo root (default: cwd)
   --dry-run                Bootstrap only — decompose, write specs, exit (DEFAULT)
-  --live                   Run the implementation loop (PR9 — not yet shipping)
-  --resume                 Resume from existing .autopilot/state.json
+  --live                   Bootstrap + run the live implementation loop. Spawns
+                           fresh \`claude -p\` per leaf goal until verifier passes
+                           or iteration cap (30) hit. Pre-commit hook installed.
+  --resume                 Continue an existing run from .autopilot/state.json.
+                           Honors paused_until if rate-limited; exits 75 if
+                           still inside the pause window so a scheduler can retry.
   --reset                  Wipe .autopilot/ and start fresh
   --council-bin <path>     Override path to council binary (default: autodetect)
   --profile <id>           Override project profile (default: auto-detect from manifest files)
@@ -439,6 +448,12 @@ async function bootstrap(args: CliArgs): Promise<void> {
     console.error(`[autopilot] --reset: wiping ${autopilotDir}`);
     const { rmSync } = await import("fs");
     rmSync(autopilotDir, { recursive: true, force: true });
+    // Also uninstall the pre-commit hook IF we authored it (idempotent: leaves
+    // user-authored hooks untouched).
+    const hookResult = uninstallPreCommitHook(args.repoRoot);
+    if (hookResult === "removed") {
+      console.error(`[autopilot] --reset: removed autopilot pre-commit hook`);
+    }
   }
 
   const existing = readState(autopilotDir);
@@ -527,22 +542,306 @@ async function bootstrap(args: CliArgs): Promise<void> {
   }
 }
 
+/* ============================================================
+ * Live mode (PR9.1) — implementation loop with worktree verifier
+ * ============================================================
+ *
+ * From council-20260502-205303 fork picks: 1B (multiple short claude -p per
+ * iteration), 2A (worktree-based verifier). Stuck detection (3C), rate-limit
+ * pause (5B), and final-review veto (4A) ship in PR9.2 / PR9.3 / PR9.4.
+ */
+
+const LIVE_MAX_ITERATIONS_PER_GOAL = 30;
+
+/** Exit codes the orchestrator emits when live mode terminates non-normally. */
+const EX_TEMPFAIL = 75;     // sysexits — temporary failure (rate-limited; resume later)
+const EX_USER_PAUSE = 130;  // SIGINT-like — user explicitly paused
+
+interface LiveResult {
+  status: "all_done" | "all_failed" | "partial" | "rate_limited" | "user_paused";
+  completed: string[];
+  failed: string[];
+  pausedUntil?: string;
+}
+
+async function runLiveMode(args: {
+  state: AutopilotState;
+  autopilotDir: string;
+  repoRoot: string;
+  profile: ProjectProfile;
+  userGoalText: string;
+}): Promise<LiveResult> {
+  // Install the pre-commit hook (load-bearing frozen-spec defense).
+  const hookResult = installPreCommitHook(args.repoRoot);
+  if (hookResult === "no-git") {
+    console.error("[autopilot] WARNING: target repo has no .git/hooks/ — pre-commit hook NOT installed.");
+    console.error("[autopilot] Frozen-spec defense is degraded. Implementing claude could edit specs without rejection.");
+  } else if (hookResult === "preserved") {
+    console.error("[autopilot] WARNING: existing pre-commit hook found that we did not author — left untouched.");
+    console.error("[autopilot] Frozen-spec defense is degraded. Add the autopilot's hook content manually if you want it.");
+  } else {
+    console.error(`[autopilot] Pre-commit hook ${hookResult} (frozen-spec defense active).`);
+  }
+
+  // Process goals in queue order. Each goal: spawn-verify-loop until green
+  // or iteration cap.
+  while (args.state.queue.length > 0) {
+    const goalId = args.state.queue[0];
+    const goal = args.state.goals.find((g) => g.id === goalId);
+    if (!goal) {
+      console.error(`[autopilot] internal error: queue references missing goal ${goalId}; skipping`);
+      args.state.queue.shift();
+      await writeState(args.autopilotDir, args.state);
+      continue;
+    }
+
+    console.error("");
+    console.error(`[autopilot] === ${goal.id}: ${goal.title} ===`);
+    console.error(`[autopilot]   spec_file:   ${goal.spec_file}`);
+    console.error(`[autopilot]   verify cmd:  ${args.profile.spec_test_command(goal.spec_file)}`);
+
+    const result = await runLeafGoal({
+      goal,
+      state: args.state,
+      autopilotDir: args.autopilotDir,
+      repoRoot: args.repoRoot,
+      profile: args.profile,
+      userGoalText: args.userGoalText,
+    });
+
+    if (result === "rate_limited") {
+      console.error(`[autopilot] rate-limited mid-goal ${goal.id}. Saving state and exiting.`);
+      console.error(`[autopilot] Resume with: bun run bin/autopilot --resume --repo ${args.repoRoot}`);
+      return {
+        status: "rate_limited",
+        completed: args.state.completed,
+        failed: args.state.failed,
+        pausedUntil: args.state.paused_until ?? undefined,
+      };
+    }
+
+    // Goal terminal state: done OR failed. Pop from queue, update lists.
+    args.state.queue.shift();
+    if (goal.status === "done") {
+      args.state.completed.push(goal.id);
+      console.error(`[autopilot] ✓ ${goal.id} done at commit ${goal.green_commit?.slice(0, 8)} after ${goal.iteration} iteration(s)`);
+    } else {
+      args.state.failed.push(goal.id);
+      console.error(`[autopilot] ✗ ${goal.id} failed: ${goal.failure_reason}`);
+    }
+    args.state.current_goal_id = null;
+    args.state.last_progress_at = new Date().toISOString();
+    await writeState(args.autopilotDir, args.state);
+  }
+
+  // All goals processed.
+  if (args.state.failed.length === 0) {
+    return { status: "all_done", completed: args.state.completed, failed: [] };
+  }
+  if (args.state.completed.length === 0) {
+    return { status: "all_failed", completed: [], failed: args.state.failed };
+  }
+  return { status: "partial", completed: args.state.completed, failed: args.state.failed };
+}
+
+/**
+ * Run one leaf goal to terminal state (done | failed | rate_limited).
+ *
+ * Per Fork 1B: orchestrator owns the iteration boundary. Each iteration is a
+ * fresh `claude -p` spawn with the previous iteration's verifier output baked
+ * into the prompt. After spawn exits, run verifier in clean worktree; if green,
+ * mark done and return; if red, loop. Hard cap at LIVE_MAX_ITERATIONS_PER_GOAL.
+ */
+async function runLeafGoal(args: {
+  goal: Goal;
+  state: AutopilotState;
+  autopilotDir: string;
+  repoRoot: string;
+  profile: ProjectProfile;
+  userGoalText: string;
+}): Promise<"done" | "failed" | "rate_limited"> {
+  args.goal.status = "in_progress";
+  args.state.current_goal_id = args.goal.id;
+  await writeState(args.autopilotDir, args.state);
+
+  let previous: PreviousIterationContext | null = null;
+
+  while (args.goal.iteration < LIVE_MAX_ITERATIONS_PER_GOAL) {
+    args.goal.iteration += 1;
+    console.error(`[autopilot]   iteration ${args.goal.iteration}/${LIVE_MAX_ITERATIONS_PER_GOAL}`);
+
+    // Regenerate AUTOPILOT.md with current state (per-spawn freshness).
+    const docPath = resolve(args.autopilotDir, "AUTOPILOT.md");
+    writeFileSync(docPath, renderAutopilotDoc({
+      state: args.state,
+      userGoalText: args.userGoalText,
+      currentGoalId: args.goal.id,
+      profile: args.profile,
+    }), "utf-8");
+
+    // Spawn fresh claude -p with the per-iteration contract.
+    const prompt = buildImplementationPrompt({
+      goal: args.goal,
+      autopilotDocPath: ".autopilot/AUTOPILOT.md",
+      goalFilePath: `.autopilot/goals/${args.goal.id}.md`,
+      specFilePath: args.goal.spec_file,
+      verifyCommand: args.profile.spec_test_command(args.goal.spec_file),
+      maxIterations: LIVE_MAX_ITERATIONS_PER_GOAL,
+      previous,
+    });
+
+    const spawn = await spawnImplementingClaude({
+      prompt,
+      repoRoot: args.repoRoot,
+      profile: args.profile,
+    });
+
+    if (spawn.rateLimit.isRateLimited) {
+      console.error(`[autopilot]     ⏸ rate-limited (${spawn.rateLimit.window}); resets ${spawn.rateLimit.resetsAt ?? "(unknown)"}`);
+      args.state.paused_until = spawn.rateLimit.resetsAt;
+      args.state.paused_reason = "rate_limit";
+      await writeState(args.autopilotDir, args.state);
+      return "rate_limited";
+    }
+    if (spawn.exitCode !== 0) {
+      console.error(`[autopilot]     ⚠ claude -p exited ${spawn.exitCode} (continuing — verifier is the source of truth)`);
+    }
+
+    // Defense in depth: spec_sha must match (catches any pre-commit-hook bypass).
+    const specCheck = await verifySpecSha({
+      repoRoot: args.repoRoot,
+      specPath: args.goal.spec_file,
+      expectedSha: args.goal.spec_sha,
+    });
+    if (!specCheck.matches) {
+      args.goal.status = "failed";
+      args.goal.failure_reason = `Spec tampered (expected sha ${args.goal.spec_sha.slice(0, 12)}, got ${specCheck.actualSha.slice(0, 12)}). Frozen-spec defense violated.`;
+      await writeState(args.autopilotDir, args.state);
+      return "failed";
+    }
+
+    // Run verifier in clean worktree (no API keys, isolated FS).
+    const verify = await verifyInWorktree({
+      repoRoot: args.repoRoot,
+      commit: undefined,  // HEAD
+      specPath: args.goal.spec_file,
+      profile: args.profile,
+    });
+    args.goal.last_test_hash = `exit=${verify.exitCode}|stdout_len=${verify.stdout.length}`;
+
+    if (verify.passed) {
+      const commit = await getCurrentCommit(args.repoRoot);
+      args.goal.status = "done";
+      args.goal.green_commit = commit;
+      args.state.last_green_commit = commit;
+      console.error(`[autopilot]     ✓ verifier passed (${verify.durationMs}ms) at ${commit?.slice(0, 8)}`);
+      await writeState(args.autopilotDir, args.state);
+      return "done";
+    }
+
+    console.error(`[autopilot]     ✗ verifier failed (exit ${verify.exitCode}, ${verify.durationMs}ms); next iteration`);
+    previous = {
+      iteration: args.goal.iteration,
+      failingTestsOutput: verify.stdout,
+      verifierStderr: verify.stderr,
+      verifierExitCode: verify.exitCode,
+    };
+    await writeState(args.autopilotDir, args.state);  // persist iteration count
+  }
+
+  // Iteration cap exhausted. PR9.2 will spawn a stuck-rescue council here.
+  args.goal.status = "failed";
+  args.goal.failure_reason = `iteration cap (${LIVE_MAX_ITERATIONS_PER_GOAL}) reached without verifier passing`;
+  await writeState(args.autopilotDir, args.state);
+  return "failed";
+}
+
+/**
+ * --resume entry point. Reads existing state and continues where we left off.
+ * Honors `paused_until` from a prior rate-limit; if still in the future, exits
+ * with EX_TEMPFAIL and tells the user when to retry.
+ */
+async function runResume(args: CliArgs): Promise<LiveResult> {
+  const autopilotDir = resolve(args.repoRoot, ".autopilot");
+  const state = readState(autopilotDir);
+  if (!state) {
+    console.error(`[autopilot] no .autopilot/state.json at ${autopilotDir}; nothing to resume`);
+    process.exit(1);
+  }
+
+  // Honor paused_until: if we're still inside the rate-limit window, exit and
+  // tell the user (or scheduler) when to retry.
+  if (state.paused_until) {
+    const resumeAt = new Date(state.paused_until);
+    const now = new Date();
+    if (resumeAt > now) {
+      const minsLeft = Math.ceil((resumeAt.getTime() - now.getTime()) / 60_000);
+      console.error(`[autopilot] still paused (${state.paused_reason}); resume scheduled for ${state.paused_until} (~${minsLeft}min from now)`);
+      console.error(`[autopilot] re-run --resume after that timestamp.`);
+      process.exit(EX_TEMPFAIL);
+    }
+    console.error(`[autopilot] paused_until window passed; clearing pause and continuing`);
+    state.paused_until = null;
+    state.paused_reason = null;
+    await writeState(autopilotDir, state);
+  }
+
+  // Resolve profile (honors --profile / --profile-file overrides; otherwise auto-detects).
+  const profile = resolveProfile(args);
+
+  // Load the original user goal text from the goal file referenced in state.
+  const goalFilePath = state.goal_file;
+  if (!existsSync(goalFilePath)) {
+    console.error(`[autopilot] goal file referenced by state.json no longer exists: ${goalFilePath}`);
+    console.error(`[autopilot] either restore the file or --reset and re-bootstrap`);
+    process.exit(1);
+  }
+  const userGoalText = readFileSync(goalFilePath, "utf-8");
+
+  return runLiveMode({ state, autopilotDir, repoRoot: args.repoRoot, profile, userGoalText });
+}
+
 // Entry point. Don't run main() during test imports (matches council.ts pattern).
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  if (args.live && !args.resume) {
-    console.error(
-      "[autopilot] --live mode is not yet implemented in this build. " +
-      "PR8 ships --dry-run only. Falling back to dry-run."
-    );
-    args.dryRun = true;
-    args.live = false;
-  }
+
+  // --resume takes precedence: load existing state, continue.
   if (args.resume) {
-    console.error("[autopilot] --resume is not yet implemented (PR9).");
-    process.exit(2);
+    const result = await runResume(args);
+    if (result.status === "rate_limited") process.exit(EX_TEMPFAIL);
+    if (result.status === "user_paused") process.exit(EX_USER_PAUSE);
+    if (result.status === "all_failed") process.exit(1);
+    return;
   }
+
+  // Fresh run: bootstrap. If --live, then run live mode after bootstrap.
   await bootstrap(args);
+
+  if (args.live) {
+    const autopilotDir = resolve(args.repoRoot, ".autopilot");
+    const state = readState(autopilotDir);
+    if (!state) {
+      console.error("[autopilot] internal error: state.json missing after bootstrap");
+      process.exit(1);
+    }
+    const profile = resolveProfile(args);
+    const userGoalText = readFileSync(state.goal_file, "utf-8");
+
+    console.error("");
+    console.error("[autopilot] === Entering live mode (PR9.1 — happy-path loop) ===");
+    console.error("[autopilot] Stuck detection / final-review veto / rate-limit pause are happy-path-only.");
+    console.error("[autopilot] PR9.2-9.4 will harden the orchestrator against those edge cases.");
+
+    const result = await runLiveMode({ state, autopilotDir, repoRoot: args.repoRoot, profile, userGoalText });
+
+    console.error("");
+    console.error(`[autopilot] Live mode finished: ${result.status}`);
+    console.error(`[autopilot]   completed: ${result.completed.length} (${result.completed.join(", ") || "(none)"})`);
+    console.error(`[autopilot]   failed:    ${result.failed.length} (${result.failed.join(", ") || "(none)"})`);
+
+    if (result.status === "rate_limited") process.exit(EX_TEMPFAIL);
+    if (result.status === "all_failed") process.exit(1);
+  }
 }
 
 // Run main() unless this file was imported by a test runner.

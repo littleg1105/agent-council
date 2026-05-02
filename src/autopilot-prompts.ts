@@ -199,25 +199,45 @@ export function parseGoalsBlock(text: string): DecompositionGoal[] | null {
 }
 
 /**
+ * Per-iteration context fed into the implementation prompt (Fork 1B from
+ * council-20260502-205303). Each fresh `claude -p` spawn gets the prior
+ * iteration's verifier output so it can pick up where the last spawn left
+ * off without persisting context across processes.
+ */
+export interface PreviousIterationContext {
+  iteration: number;             // 1-indexed iteration number this is
+  failingTestsOutput: string;    // verifier stdout from the last attempt
+  verifierStderr: string;        // verifier stderr (often more useful than stdout)
+  verifierExitCode: number;
+}
+
+/**
  * Build the per-goal implementation prompt that gets passed to a fresh
- * `claude -p` subprocess in live mode (PR9). Each invocation is a fresh
- * contractor with no memory of prior goals; the prompt carries the entire
- * contract.
+ * `claude -p` subprocess. Each invocation is a fresh contractor with no
+ * memory of prior goals OR prior iterations of this goal; the prompt carries
+ * the entire contract plus the last iteration's verifier output.
  *
- * Note: PR8 ships this builder but does not invoke it (dry-run only). PR9
- * wires it into the live implementation loop.
+ * Council picked Fork 1B: orchestrator owns the iteration boundary. Each
+ * spawn implements ONE round (try to make the test pass, commit, exit) and
+ * the orchestrator decides what to do next based on the verifier result.
  */
 export function buildImplementationPrompt(args: {
   goal: Goal;
   autopilotDocPath: string;     // e.g. ".autopilot/AUTOPILOT.md"
   goalFilePath: string;          // e.g. ".autopilot/goals/g3.md"
-  specFilePath: string;          // e.g. ".council/specs/g3.test.ts"
-  verifyCommand: string;         // e.g. "bun run autopilot verify --goal g3"
-  maxIterations: number;         // e.g. 30
+  specFilePath: string;          // e.g. ".council/specs/test_g3.py"
+  verifyCommand: string;         // e.g. "poetry run pytest .council/specs/test_g3.py"
+  maxIterations: number;         // hard cap, e.g. 30
+  previous?: PreviousIterationContext | null;  // null on iteration 1
 }): string {
+  const isFirstIteration = !args.previous || args.previous.iteration <= 1;
+  const previousBlock = isFirstIteration
+    ? "This is iteration 1 — fresh start. No prior verifier output."
+    : renderPreviousBlock(args.previous!);
+
   return `You are an implementing agent in an autonomous loop. You have no memory of
 prior goals or sessions; everything you need is in the files referenced
-below.
+below or in this prompt.
 
 # Read these files BEFORE doing anything
 
@@ -231,42 +251,85 @@ ${args.goal.title}
 
 ${args.goal.description}
 
-# What "done" means
+# What "done" means for this iteration
 
-Run: \`${args.verifyCommand}\`
+Make code changes that move the test spec closer to passing (or all the way
+to passing). When you've made meaningful progress, COMMIT and exit. The
+orchestrator will then run the spec in a clean checkout and either:
+  - advance to the next goal (if all spec assertions pass), or
+  - spawn a fresh you with the new failing-test output (this prompt, again,
+    with the "Previous iteration" section updated).
 
-If it exits 0: commit your work with a Conventional Commit message (e.g.
-\`feat(${args.goal.id}): <what you did>\`) and exit. The orchestrator will
-take over from there.
+You do NOT need to make all assertions pass in one iteration. You SHOULD
+make progress (committed changes that affect the verifier's output) and
+exit. Use ONE iteration's worth of work, not the whole goal in one shot.
 
-If it exits non-zero: iterate. Read the failing test output, change code (NOT
-the spec), re-run. Repeat up to ${args.maxIterations} iterations.
+The verify command is: \`${args.verifyCommand}\`
 
-# Hard rules
+You CAN run that command yourself to check your progress before committing.
+But the orchestrator runs it again in a clean isolated checkout (no API keys
+in env, fresh worktree) and that result — not yours — is the green/red signal.
+
+# Previous iteration
+
+${previousBlock}
+
+# Hard rules (orchestrator-enforced; violations cause hard failure)
 
 - DO NOT modify \`${args.specFilePath}\` or anything else under
-  \`.council/specs/\` — a pre-commit hook will reject any change. The spec is
-  the contract.
-- DO NOT modify \`.autopilot/state.json\` — the orchestrator owns it.
-- DO NOT advance to other goals or touch files unrelated to this goal — other
-  sessions are responsible for those.
-- DO NOT run destructive git commands (reset --hard, push, branch -D). The
-  orchestrator handles rollback.
-- DO commit each meaningful step (lets the orchestrator track progress and
-  roll back to known-green commits if needed).
+  \`.council/specs/\`. A pre-commit hook rejects spec edits. The spec is
+  the contract — make the code match it.
+- DO NOT modify \`.autopilot/state.json\`, \`.autopilot/control.json\`, or
+  any other file under \`.autopilot/\`. The orchestrator owns those.
+- DO NOT touch other goals' code unless this goal's spec requires it.
+- DO NOT run destructive git (reset --hard, push, checkout, branch -D,
+  rebase, merge). The orchestrator handles rollback. Your tool allowlist
+  blocks these.
+- DO NOT install dependencies (poetry add, npm install, pip install,
+  cargo add). Dependency-tree changes invalidate the verifier's cache and
+  may break other goals. Your tool allowlist blocks these.
+- DO commit each meaningful change with a Conventional Commit message
+  (e.g., \`feat(${args.goal.id}): add Foo schema\`). Multiple small commits
+  per iteration are better than one giant one.
 
-# When you can't make it pass
+# When stuck
 
-If after ${args.maxIterations} iterations or 30 minutes wall time you can't
-make the test pass:
+If you've tried multiple approaches and aren't making progress:
 
-1. Append a brief failure note to \`.autopilot/notes/${args.goal.id}-attempts.md\`
-   describing what you tried and where you got stuck.
-2. Exit with a non-zero code. The orchestrator will run a stuck-rescue council
-   or roll back and mark the goal failed.
+1. Append your reasoning to \`.autopilot/notes/${args.goal.id}-attempts.md\`
+   (orchestrator allows writes there) — what you tried, what failed, and
+   what you'd try next.
+2. Exit. The orchestrator will spawn a stuck-rescue council if appropriate.
 
-Begin by reading the three files listed above, then start implementing.
+Begin by reading the three files listed above. Hard cap: ${args.maxIterations}
+total iterations across all spawns. The orchestrator tracks the count.
 `;
+}
+
+function renderPreviousBlock(prev: PreviousIterationContext): string {
+  const stdout = truncateMiddle(prev.failingTestsOutput, 4000);
+  const stderr = truncateMiddle(prev.verifierStderr, 1500);
+  return `Iteration ${prev.iteration} verifier exited with code ${prev.verifierExitCode}.
+
+Verifier stdout (test output):
+\`\`\`
+${stdout}
+\`\`\`
+
+Verifier stderr:
+\`\`\`
+${stderr}
+\`\`\`
+
+Read the failing assertions, then make targeted changes for THIS iteration.
+Don't try to make the whole spec pass at once if you've already made
+multiple iterations — pick ONE failure to address and commit incrementally.`;
+}
+
+function truncateMiddle(s: string, maxLen: number): string {
+  if (s.length <= maxLen) return s;
+  const half = Math.floor((maxLen - 100) / 2);
+  return `${s.slice(0, half)}\n\n[... ${s.length - maxLen + 100} chars elided ...]\n\n${s.slice(-half)}`;
 }
 
 /**
