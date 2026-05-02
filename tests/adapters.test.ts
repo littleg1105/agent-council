@@ -190,22 +190,35 @@ describe("geminiAdapter", () => {
     expect(result.status).toBe("error");
   });
 
-  test("command: default opts produces base argv", () => {
+  test("command: default opts produces base argv with --approval-mode plan", () => {
     const cmd = geminiAdapter.command("test question", "/repo");
-    expect(cmd).toEqual(["gemini", "-p", "test question", "-o", "json"]);
+    expect(cmd).toEqual(["gemini", "-p", "test question", "--approval-mode", "plan", "-o", "json"]);
   });
 
   test("command: effort is silently ignored (no flag exists)", () => {
     const cmd = geminiAdapter.command("test question", "/repo", { effort: "max", stream: false });
-    expect(cmd).toEqual(["gemini", "-p", "test question", "-o", "json"]);
+    expect(cmd).toEqual(["gemini", "-p", "test question", "--approval-mode", "plan", "-o", "json"]);
   });
 
-  test("command: model option inserts -m before -o", () => {
+  test("command: model option inserts -m before -o, after --approval-mode", () => {
     const cmd = geminiAdapter.command("test question", "/repo", { effort: "off", stream: false, model: "gemini-3-pro" });
     expect(cmd).toContain("-m");
     expect(cmd).toContain("gemini-3-pro");
+    expect(cmd).toContain("--approval-mode");
+    expect(cmd).toContain("plan");
     expect(cmd[cmd.length - 2]).toBe("-o");
     expect(cmd[cmd.length - 1]).toBe("json");
+  });
+
+  test("command: --approval-mode plan is always set (prevents agentic recursion in -p mode)", () => {
+    const cmd1 = geminiAdapter.command("q", "/r");
+    const cmd2 = geminiAdapter.command("q", "/r", { effort: "max", stream: false });
+    const cmd3 = geminiAdapter.command("q", "/r", { effort: "off", stream: false, model: "x" });
+    for (const cmd of [cmd1, cmd2, cmd3]) {
+      const idx = cmd.indexOf("--approval-mode");
+      expect(idx).toBeGreaterThan(-1);
+      expect(cmd[idx + 1]).toBe("plan");
+    }
   });
 });
 

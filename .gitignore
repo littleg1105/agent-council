@@ -5,3 +5,4 @@ bin/council-bin
 .DS_Store
 .gstack/
 .omx/
+.gemini/

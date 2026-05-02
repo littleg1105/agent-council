@@ -74,6 +74,19 @@ fi
 # Gemini CLI: ~/.gemini/skills/
 if command -v gemini &>/dev/null; then
   install_skills "$HOME/.gemini/skills" "Gemini"
+
+  # IMPORTANT: disable agent-council skills FOR Gemini at user scope.
+  # When Gemini is invoked AS a council member (gemini -p "<question>" -o json),
+  # its skill matcher hits descriptions like "Convene a panel of CLI-based AI
+  # agents..." and triggers internal LocalAgentExecutor recursion (subagent
+  # dispatch loop) that hangs for 15+ minutes producing empty output.
+  # The skills remain installed so they can be re-enabled if Gemini is ever
+  # used as a chairman, but the default state is disabled to keep Gemini
+  # functional as a council member.
+  for skill in council council-list council-outcome council-replay council-revisit agent-council-nudge; do
+    gemini skills disable "$skill" --scope user >/dev/null 2>&1 || true
+  done
+  echo "✓ Disabled agent-council skills for Gemini (prevents recursive subagent dispatch when Gemini is invoked as a council member)"
 fi
 
 if [ -n "$INSTALLED_TO" ]; then

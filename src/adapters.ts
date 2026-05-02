@@ -441,7 +441,19 @@ export const geminiAdapter: AgentAdapter = {
   command(prompt: string, _repoRoot: string, opts: DispatchOptions = DEFAULT_DISPATCH_OPTIONS): string[] {
     // Gemini 3 thinks by default; no reasoning-effort flag exists in the CLI surface.
     // We honor opts.model if provided. opts.effort is intentionally ignored.
-    const argv = ["gemini", "-p", prompt];
+    //
+    // --approval-mode plan: read-only mode. Prevents Gemini from attempting tool
+    //   actions (file edits, shell commands) that would otherwise wait forever for
+    //   approval prompts that never come in -p (non-interactive) mode. Without this,
+    //   complex prompts can trigger Gemini's internal LocalAgentExecutor recursion
+    //   loop (observed in council-20260501-151602: a 17-minute hang where Gemini
+    //   tried to dispatch its own subagents — `codebase_investigator`, `generalist`,
+    //   `cli_help` — hit recursion guards, looped, and produced empty output).
+    //   Also disable the project's own agent-council skills at user scope for
+    //   Gemini (`gemini skills disable council --scope user` plus the related
+    //   council-*/ agent-council-nudge skills) — those skills match prompt
+    //   keywords and trigger the same dispatch loop even with plan mode.
+    const argv = ["gemini", "-p", prompt, "--approval-mode", "plan"];
     if (opts.model) argv.push("-m", opts.model);
     argv.push("-o", "json");
     return argv;
