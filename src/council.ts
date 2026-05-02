@@ -45,11 +45,19 @@ const DEFAULT_EFFORT: Record<string, EffortLevel> = {
   gemini: "max",
 };
 
+// Empty string = "let the CLI pick its default model for the active subscription
+// tier". Pin a specific model via ~/.council/config.json `models` for run-to-run
+// reproducibility. Council session council-20260501-134956 caught the bug where
+// these values were plumbed through every adapter (adapters.ts) but never
+// actually set by any caller — so the config field advertised model pinning
+// while live runs rode CLI defaults. PR7 fixed the plumbing; the gemini default
+// changed from "gemini-3.1-pro" (which returns ModelNotFoundError) to "" so
+// out-of-the-box runs don't fail.
 const DEFAULT_CONFIG: CouncilConfig = {
   models: {
-    claude: "claude-opus-4-6",
-    codex: "gpt-5.4",
-    gemini: "gemini-3.1-pro",
+    claude: "",
+    codex: "",
+    gemini: "",
   },
   timeout_ms: { ...DEFAULT_TIMEOUTS },
   quorum_grace_ms: 60_000,
@@ -447,6 +455,7 @@ async function dispatchWithQuorum(
   repoRoot: string,
   timeouts: Record<string, number>,
   effortByAgent: Record<string, EffortLevel>,
+  modelsByAgent: Record<string, string>,
   gracePeriodMs: number,
   stageName: string,
   retries: number = 1
@@ -533,6 +542,9 @@ async function dispatchWithQuorum(
         effort: effortByAgent[adapter.id] || "off",
         stream: false,
       };
+      // PR7: honor configured model when set. Empty string means "let CLI pick".
+      const pinnedModel = modelsByAgent[adapter.id];
+      if (pinnedModel) agentOpts.model = pinnedModel;
       dispatchAgentWithRetry(adapter, prompt, repoRoot, agentTimeout, agentOpts, retries, controls[i]).then((result) => {
         results[i] = result;
         completedCount++;
@@ -574,10 +586,11 @@ async function runStage1(
   repoRoot: string,
   timeouts: Record<string, number>,
   effortByAgent: Record<string, EffortLevel>,
+  modelsByAgent: Record<string, string>,
   gracePeriodMs: number
 ): Promise<AgentResult[]> {
   const prompt = stage1Prompt(question, context);
-  return dispatchWithQuorum(members, prompt, repoRoot, timeouts, effortByAgent, gracePeriodMs, "Stage 1");
+  return dispatchWithQuorum(members, prompt, repoRoot, timeouts, effortByAgent, modelsByAgent, gracePeriodMs, "Stage 1");
 }
 
 // --- Stage 2: Anonymized Peer Review ---
@@ -605,11 +618,12 @@ async function runStage2(
   repoRoot: string,
   timeouts: Record<string, number>,
   effortByAgent: Record<string, EffortLevel>,
+  modelsByAgent: Record<string, string>,
   gracePeriodMs: number
 ): Promise<AgentResult[]> {
   const { anonymized } = anonymizeOpinions(opinions);
   const prompt = stage2Prompt(question, anonymized);
-  return dispatchWithQuorum(members, prompt, repoRoot, timeouts, effortByAgent, gracePeriodMs, "Stage 2", 0);
+  return dispatchWithQuorum(members, prompt, repoRoot, timeouts, effortByAgent, modelsByAgent, gracePeriodMs, "Stage 2", 0);
 }
 
 // --- Storage ---
@@ -798,6 +812,7 @@ async function revisitSession(
     repoRoot,
     config.timeout_ms,
     config.effort,
+    config.models,
     config.quorum_grace_ms
   );
 
@@ -949,6 +964,9 @@ async function runNudge(
     effort: config.effort[targetAgent] || "off",
     stream: false,
   };
+  // PR7: honor configured model when set. Empty string means "let CLI pick".
+  const pinnedNudgeModel = config.models[targetAgent];
+  if (pinnedNudgeModel) nudgeOpts.model = pinnedNudgeModel;
 
   console.error(`\nNudging ${targetAgent} with correction...`);
   console.error(`  Original recommendation: ${originalOpinion.recommendation?.slice(0, 80) || "(unstructured)"}...`);
@@ -1443,6 +1461,7 @@ async function main(): Promise<void> {
     repoRoot,
     config.timeout_ms,
     config.effort,
+    config.models,
     config.quorum_grace_ms
   );
 
@@ -1491,6 +1510,7 @@ async function main(): Promise<void> {
       repoRoot,
       config.timeout_ms,
       config.effort,
+      config.models,
       config.quorum_grace_ms
     );
 

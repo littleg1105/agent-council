@@ -47,7 +47,7 @@ Config: `~/.council/config.json`
 - Timeouts (per mode): `quick` 180s · `fast` (default) 600s · `thorough` 900s. All agents share the per-mode value unless `~/.council/config.json` overrides per-agent.
 - Reasoning effort (per mode): `quick` high · `fast` max · `thorough` max. Claude → `--effort <level>`; Codex → `-c model_reasoning_effort=<level>` (`max` maps to `xhigh`); Gemini has no flag (Gemini 3 thinks by default).
 - Quorum grace: `quick` 180s · `fast` 600s · `thorough` 900s. Each grace floor matches its mode's per-agent timeout — once quorum is reached, stragglers get their full per-agent budget. The `dispatchWithQuorum` clamp also extends grace if user config sets a longer per-agent timeout, so no agent is ever cut below its own limit.
-- Models: claude-opus-4-6, gpt-5.4, gemini-3.1-pro
+- Models: empty by default — each CLI picks its tier-default. To pin specific models for run-to-run reproducibility (recommended for autopilot/long-running sessions), set `models` in `~/.council/config.json`, e.g. `{ "models": { "claude": "opus", "codex": "gpt-5.4", "gemini": "<verified-name>" } }`. Empty string = "let CLI pick default". Note: `gemini-3.1-pro` returns `ModelNotFoundError` on Gemini CLI 0.38.2 — verify your subscription's valid model name before pinning.
 - Proactive nudges: true
 
 CLI overrides: `--effort <max|high|medium|low|off>` (one-run override), `--unbounded` (no timeout — use sparingly for hard architectural questions). Config-file `~/.council/config.json` accepts `effort` (string or per-agent object), `timeout_ms` (number or per-agent object), `quorum_grace_ms`, `models`. User config always wins over mode defaults.

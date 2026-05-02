@@ -249,6 +249,71 @@ describe("dispatchAgent abort handling", () => {
     expect(result.error_class).toBeUndefined();
   }, 10_000);
 
+  test("PR7: model field flows through DispatchOptions into adapter command()", async () => {
+    // Build a fake adapter that captures the opts it received from the dispatcher.
+    let capturedOpts: any = null;
+    const adapter: AgentAdapter = {
+      id: "codex" as AgentId,
+      binary: "bash",
+      salvagesPartial: false,
+      detect: async () => true,
+      command: (_p, _r, opts) => {
+        capturedOpts = opts;
+        return ["bash", "-c", "echo done"];
+      },
+      parseOutput: (stdout, _stderr, exitCode, durationMs): AgentResult => ({
+        agent: "codex" as AgentId,
+        status: exitCode === 0 ? "ok" : "error",
+        structured: false,
+        response: stdout.trim(),
+        duration_ms: durationMs,
+        timestamp: new Date().toISOString(),
+      }),
+    };
+
+    const result = await dispatchAgent(adapter, "test", "/tmp", 5_000, {
+      effort: "max",
+      stream: false,
+      model: "gpt-5.4",
+    });
+
+    expect(result.status).toBe("ok");
+    expect(capturedOpts).not.toBeNull();
+    expect(capturedOpts.model).toBe("gpt-5.4");
+    expect(capturedOpts.effort).toBe("max");
+  }, 10_000);
+
+  test("PR7: empty-string model is omitted from opts (lets CLI pick default)", async () => {
+    let capturedOpts: any = null;
+    const adapter: AgentAdapter = {
+      id: "gemini" as AgentId,
+      binary: "bash",
+      salvagesPartial: false,
+      detect: async () => true,
+      command: (_p, _r, opts) => {
+        capturedOpts = opts;
+        return ["bash", "-c", "echo done"];
+      },
+      parseOutput: (stdout, _stderr, exitCode, durationMs): AgentResult => ({
+        agent: "gemini" as AgentId,
+        status: exitCode === 0 ? "ok" : "error",
+        structured: false,
+        response: stdout.trim(),
+        duration_ms: durationMs,
+        timestamp: new Date().toISOString(),
+      }),
+    };
+
+    // No model passed
+    const result = await dispatchAgent(adapter, "test", "/tmp", 5_000, {
+      effort: "max",
+      stream: false,
+    });
+
+    expect(result.status).toBe("ok");
+    expect(capturedOpts.model).toBeUndefined();
+  }, 10_000);
+
   test("tag-before-abort race-safety: abortReason set BEFORE abort() classifies correctly", async () => {
     // If we abort BEFORE setting abortReason, the listener fires, the dispatch
     // resumes, and abortReason is null — it falls through to the "normal exit"
