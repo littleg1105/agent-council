@@ -7,23 +7,92 @@ import {
   parseGoalsBlock,
 } from "../src/autopilot-prompts";
 import type { Goal } from "../src/autopilot-state";
+import {
+  PROFILE_TYPESCRIPT_BUN,
+  PROFILE_PYTHON_POETRY,
+  PROFILE_PYTHON_PYTEST,
+  PROFILE_GO,
+  PROFILE_RUST,
+  PROFILE_RUBY_RSPEC,
+  PROFILE_GENERIC,
+} from "../src/autopilot-profile";
 
 describe("buildBootstrapPrompt", () => {
   test("includes the user goal verbatim", () => {
-    const out = buildBootstrapPrompt("Build a Markov chain text generator with stress tests.");
+    const out = buildBootstrapPrompt("Build a Markov chain text generator with stress tests.", PROFILE_TYPESCRIPT_BUN);
     expect(out).toContain("Build a Markov chain text generator with stress tests.");
   });
 
   test("instructs the structured GOALS block format", () => {
-    const out = buildBootstrapPrompt("any goal");
+    const out = buildBootstrapPrompt("any goal", PROFILE_TYPESCRIPT_BUN);
     expect(out).toContain("===GOALS===");
     expect(out).toContain("===END===");
     expect(out).toContain("spec_content");
   });
 
   test("declares the leaf cap", () => {
-    const out = buildBootstrapPrompt("any goal");
+    const out = buildBootstrapPrompt("any goal", PROFILE_TYPESCRIPT_BUN);
     expect(out).toContain(`Maximum ${MAX_LEAF_GOALS}`);
+  });
+});
+
+describe("buildBootstrapPrompt — multi-architecture (PR9)", () => {
+  test("TypeScript+Bun profile: prompt mentions bun:test and bun test", () => {
+    const out = buildBootstrapPrompt("any goal", PROFILE_TYPESCRIPT_BUN);
+    expect(out).toContain("Bun + TypeScript");
+    expect(out).toContain("bun:test");
+    expect(out).toContain("bun test");
+    expect(out).toContain(".test.ts");
+  });
+
+  test("Python+Poetry profile: prompt mentions pytest and poetry run pytest, NOT bun", () => {
+    const out = buildBootstrapPrompt("any goal", PROFILE_PYTHON_POETRY);
+    expect(out).toContain("pytest");
+    expect(out).toContain("poetry run pytest");
+    expect(out).not.toContain("bun:test");
+    expect(out).not.toContain("Bun + TypeScript");
+  });
+
+  test("Python+pytest profile: prompt mentions pytest, NOT poetry", () => {
+    const out = buildBootstrapPrompt("any goal", PROFILE_PYTHON_PYTEST);
+    expect(out).toContain("pytest");
+    expect(out).not.toContain("poetry run");
+    expect(out).not.toContain("bun:test");
+  });
+
+  test("Go profile: prompt mentions go test and warns about package-aware discovery", () => {
+    const out = buildBootstrapPrompt("any goal", PROFILE_GO);
+    expect(out).toContain("Go");
+    expect(out).toContain("go test");
+    expect(out).toContain("package-aware");
+    expect(out).not.toContain("bun:test");
+  });
+
+  test("Rust profile: prompt mentions cargo test and tests/ directory convention", () => {
+    const out = buildBootstrapPrompt("any goal", PROFILE_RUST);
+    expect(out).toContain("Rust");
+    expect(out).toContain("cargo test");
+    expect(out).toContain("tests/");
+    expect(out).not.toContain("bun:test");
+  });
+
+  test("Ruby+RSpec profile: prompt mentions rspec and bundle exec", () => {
+    const out = buildBootstrapPrompt("any goal", PROFILE_RUBY_RSPEC);
+    expect(out).toContain("RSpec");
+    expect(out).toContain("bundle exec rspec");
+    expect(out).toContain("_spec.rb");
+    expect(out).not.toContain("bun:test");
+  });
+
+  test("Generic profile: prompt warns about no test runner configured", () => {
+    const out = buildBootstrapPrompt("any goal", PROFILE_GENERIC);
+    expect(out.toLowerCase()).toContain("no project type");
+    expect(out).not.toContain("bun:test");
+  });
+
+  test("Spec example shape from the profile is included", () => {
+    const out = buildBootstrapPrompt("any goal", PROFILE_PYTHON_POETRY);
+    expect(out).toContain("def test_g1");
   });
 });
 

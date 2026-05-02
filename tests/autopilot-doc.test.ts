@@ -1,6 +1,7 @@
 import { describe, test, expect } from "bun:test";
 import { renderAutopilotDoc } from "../src/autopilot-doc";
 import { defaultState, type AutopilotState, type Goal } from "../src/autopilot-state";
+import { PROFILE_TYPESCRIPT_BUN, PROFILE_PYTHON_POETRY, PROFILE_GENERIC } from "../src/autopilot-profile";
 
 function makeGoal(id: string, status: Goal["status"] = "pending", title = `${id} title`): Goal {
   return {
@@ -27,6 +28,7 @@ describe("renderAutopilotDoc", () => {
       state,
       userGoalText: "Build a Markov chain text generator with stress tests.",
       currentGoalId: null,
+      profile: PROFILE_TYPESCRIPT_BUN,
     });
     expect(doc).toContain("Build a Markov chain text generator with stress tests.");
   });
@@ -40,6 +42,7 @@ describe("renderAutopilotDoc", () => {
       state,
       userGoalText: "x",
       currentGoalId: "g2",
+      profile: PROFILE_TYPESCRIPT_BUN,
     });
     expect(doc).toContain("g2");
     expect(doc).toContain("YOU ARE HERE");
@@ -47,7 +50,7 @@ describe("renderAutopilotDoc", () => {
 
   test("surfaces hard rules verbatim (frozen specs, no state edits, no destructive git)", () => {
     const state = makeStateWithGoals([], false);
-    const doc = renderAutopilotDoc({ state, userGoalText: "x", currentGoalId: null });
+    const doc = renderAutopilotDoc({ state, userGoalText: "x", currentGoalId: null, profile: PROFILE_TYPESCRIPT_BUN });
     expect(doc).toContain("Frozen specs");
     expect(doc).toContain(".council/specs/");
     expect(doc).toContain(".autopilot/state.json");
@@ -56,13 +59,13 @@ describe("renderAutopilotDoc", () => {
 
   test("dry-run mode is reflected in the snapshot", () => {
     const state = makeStateWithGoals([], false);
-    const doc = renderAutopilotDoc({ state, userGoalText: "x", currentGoalId: null });
+    const doc = renderAutopilotDoc({ state, userGoalText: "x", currentGoalId: null, profile: PROFILE_TYPESCRIPT_BUN });
     expect(doc).toContain("DRY-RUN");
   });
 
   test("live mode is reflected in the snapshot", () => {
     const state = makeStateWithGoals([], true);
-    const doc = renderAutopilotDoc({ state, userGoalText: "x", currentGoalId: null });
+    const doc = renderAutopilotDoc({ state, userGoalText: "x", currentGoalId: null, profile: PROFILE_TYPESCRIPT_BUN });
     expect(doc).toContain("LIVE");
   });
 
@@ -72,9 +75,30 @@ describe("renderAutopilotDoc", () => {
       true
     );
     state.completed = ["g1"];
-    const doc = renderAutopilotDoc({ state, userGoalText: "x", currentGoalId: "g2" });
+    const doc = renderAutopilotDoc({ state, userGoalText: "x", currentGoalId: "g2", profile: PROFILE_TYPESCRIPT_BUN });
     expect(doc).toContain("Completed thing");
     expect(doc).toContain("deadbeef"); // the fake green_commit
+  });
+
+  test("conventions section reflects the active profile (Python+Poetry)", () => {
+    const state = makeStateWithGoals([], false);
+    const doc = renderAutopilotDoc({
+      state, userGoalText: "x", currentGoalId: null, profile: PROFILE_PYTHON_POETRY,
+    });
+    expect(doc).toContain("Python");
+    expect(doc).toContain("pytest");
+    expect(doc).toContain("poetry run pytest");
+    expect(doc).not.toContain("Bun + TypeScript");
+    expect(doc).not.toContain("bun:test");
+  });
+
+  test("conventions section reflects generic profile when no project type", () => {
+    const state = makeStateWithGoals([], false);
+    const doc = renderAutopilotDoc({
+      state, userGoalText: "x", currentGoalId: null, profile: PROFILE_GENERIC,
+    });
+    expect(doc).toContain("Generic");
+    expect(doc).not.toContain("bun:test");
   });
 
   test("status icons are correct for each state", () => {
@@ -88,7 +112,7 @@ describe("renderAutopilotDoc", () => {
       ],
       true
     );
-    const doc = renderAutopilotDoc({ state, userGoalText: "x", currentGoalId: null });
+    const doc = renderAutopilotDoc({ state, userGoalText: "x", currentGoalId: null, profile: PROFILE_TYPESCRIPT_BUN });
     expect(doc).toContain("[x] **g1**");  // done
     expect(doc).toContain("[~] **g2**");  // in_progress
     expect(doc).toContain("[?] **g3**");  // needs_review

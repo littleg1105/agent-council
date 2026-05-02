@@ -47,6 +47,13 @@ import {
   type Goal,
 } from "./autopilot-state";
 import { renderAutopilotDoc } from "./autopilot-doc";
+import {
+  detectProfile,
+  loadCustomProfile,
+  listProfileIds,
+  profileById,
+  type ProjectProfile,
+} from "./autopilot-profile";
 
 interface CliArgs {
   goalFile: string;
@@ -55,8 +62,9 @@ interface CliArgs {
   live: boolean;        // explicit --live; overrides dry_run
   resume: boolean;      // future: resume from saved state
   reset: boolean;       // wipe .autopilot/ and start fresh
-  // councilBin is autodetected; override for testing
-  councilBin?: string;
+  councilBin?: string;  // override council binary (for testing)
+  profileId?: string;   // --profile <id> override; auto-detect if absent
+  profileFile?: string; // --profile-file <path> custom profile JSON
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -67,6 +75,8 @@ function parseArgs(argv: string[]): CliArgs {
   let resume = false;
   let reset = false;
   let councilBin: string | undefined;
+  let profileId: string | undefined;
+  let profileFile: string | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -80,6 +90,8 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === "--resume") resume = true;
     else if (a === "--reset") reset = true;
     else if (a === "--council-bin") councilBin = argv[++i];
+    else if (a === "--profile") profileId = argv[++i];
+    else if (a === "--profile-file") profileFile = argv[++i];
     else if (a === "--help" || a === "-h") {
       printHelp();
       process.exit(0);
@@ -92,7 +104,7 @@ function parseArgs(argv: string[]): CliArgs {
     process.exit(1);
   }
 
-  return { goalFile, repoRoot, dryRun, live, resume, reset, councilBin };
+  return { goalFile, repoRoot, dryRun, live, resume, reset, councilBin, profileId, profileFile };
 }
 
 function printHelp(): void {
@@ -106,7 +118,21 @@ Options:
   --resume                 Resume from existing .autopilot/state.json
   --reset                  Wipe .autopilot/ and start fresh
   --council-bin <path>     Override path to council binary (default: autodetect)
+  --profile <id>           Override project profile (default: auto-detect from manifest files)
+                           Built-in: ${listProfileIds().join(", ")}
+  --profile-file <path>    Load a custom profile from JSON (for stacks not covered above)
   --help, -h               Show this help
+
+Project profile auto-detection (override with --profile or --profile-file):
+  pyproject.toml + poetry  → python-poetry
+  pyproject.toml / setup.py → python-pytest
+  package.json + bun       → typescript-bun
+  package.json + vitest    → typescript-node
+  package.json + jest      → typescript-jest
+  go.mod                   → go
+  Cargo.toml               → rust
+  Gemfile + rspec          → ruby-rspec
+  (none of the above)      → generic (fallback; user should configure)
 
 Files written under <repo>/.autopilot/:
   state.json               Orchestrator state (compaction-survivable)
@@ -115,7 +141,8 @@ Files written under <repo>/.autopilot/:
   notes/g<N>-attempts.md   Failure notes when a goal gets stuck (live mode only)
 
 Files written under <repo>/.council/specs/:
-  g<N>.test.ts             Frozen test specs (do not edit)
+  g<N>.<spec_ext>          Frozen test specs in the project's native format
+                           (.test.ts for TS, _test.py for Python, etc.)
 `);
 }
 
@@ -140,6 +167,44 @@ function locateCouncilBin(override?: string): string {
     "Could not locate the agent-council binary. Pass --council-bin <path> or " +
     "ensure agent-council is installed at one of the standard skill paths."
   );
+}
+
+/**
+ * Resolve the active project profile from CLI args. Priority:
+ *   1. --profile-file <path>: load custom JSON profile
+ *   2. --profile <id>: pick a built-in by id (errors if unknown)
+ *   3. auto-detect from manifest files in repo root
+ *
+ * Returns the chosen profile; never null (falls back to generic if nothing matches).
+ */
+function resolveProfile(args: CliArgs): ProjectProfile {
+  if (args.profileFile) {
+    const profile = loadCustomProfile(resolve(args.profileFile));
+    console.error(`[autopilot] Loaded custom profile from ${args.profileFile}: ${profile.display_name}`);
+    return profile;
+  }
+  if (args.profileId) {
+    const profile = profileById(args.profileId);
+    if (!profile) {
+      throw new Error(
+        `Unknown profile id: "${args.profileId}". Built-in: ${listProfileIds().join(", ")}. ` +
+        `Use --profile-file <path> to load a custom profile.`
+      );
+    }
+    console.error(`[autopilot] Using --profile override: ${profile.display_name}`);
+    return profile;
+  }
+  const detected = detectProfile(args.repoRoot);
+  if (detected.id === "generic") {
+    console.error(
+      `[autopilot] WARNING: no project type detected at ${args.repoRoot}. Falling back to ` +
+      `generic profile. The bootstrap council will be told the runner is not configured. ` +
+      `Use --profile <id> or --profile-file <path> to fix.`
+    );
+  } else {
+    console.error(`[autopilot] Auto-detected project profile: ${detected.display_name}`);
+  }
+  return detected;
 }
 
 /**
@@ -256,6 +321,7 @@ async function runSynthesizer(args: {
 async function writeGoalArtifacts(args: {
   repoRoot: string;
   decomposition: DecompositionGoal[];
+  profile: ProjectProfile;
 }): Promise<Goal[]> {
   const goalsDir = resolve(args.repoRoot, ".autopilot", "goals");
   const specsDir = resolve(args.repoRoot, ".council", "specs");
@@ -270,7 +336,10 @@ async function writeGoalArtifacts(args: {
       throw new Error(`decomposition has out-of-order id: expected ${id}, got ${d.id}`);
     }
     const goalPath = resolve(goalsDir, `${id}.md`);
-    const specPath = resolve(specsDir, `${id}.test.ts`);
+    const specFilename = args.profile.spec_filename(id);
+    const specPath = resolve(specsDir, specFilename);
+    const specRelPath = `.council/specs/${specFilename}`;
+    const verifyCmd = args.profile.spec_test_command(specRelPath);
 
     const goalDoc = `# ${id}: ${d.title}
 
@@ -278,9 +347,12 @@ ${d.description}
 
 ## Acceptance
 
-This goal is verified by the test spec at \`.council/specs/${id}.test.ts\`. The
-spec is FROZEN at decomposition time — the implementing session cannot edit
-it. When \`bun test .council/specs/${id}.test.ts\` exits 0, the goal is done.
+This goal is verified by the test spec at \`${specRelPath}\`. The spec is
+FROZEN at decomposition time — the implementing session cannot edit it.
+When \`${verifyCmd}\` exits 0, the goal is done.
+
+Project profile: **${args.profile.display_name}** (${args.profile.language})
+Test framework: ${args.profile.test_framework}
 `;
 
     writeFileSync(goalPath, goalDoc, "utf-8");
@@ -291,7 +363,7 @@ it. When \`bun test .council/specs/${id}.test.ts\` exits 0, the goal is done.
       id,
       title: d.title,
       description: d.description,
-      spec_file: `.council/specs/${id}.test.ts`,
+      spec_file: specRelPath,
       spec_sha: sha,
       status: "pending",
       green_commit: null,
@@ -330,9 +402,14 @@ async function bootstrap(args: CliArgs): Promise<void> {
   }
   const userGoalText = readFileSync(args.goalFile, "utf-8");
 
-  // 1. Bootstrap council
+  // 0. Resolve project profile (auto-detect or CLI override). Determines
+  //    the spec format the bootstrap council will produce.
+  const profile = resolveProfile(args);
+
+  // 1. Bootstrap council (profile-aware prompt — language, test framework,
+  //    verify command all baked in)
   const councilBin = locateCouncilBin(args.councilBin);
-  const question = buildBootstrapPrompt(userGoalText);
+  const question = buildBootstrapPrompt(userGoalText, profile);
   const sessionDir = await dispatchBootstrapCouncil({
     councilBin,
     question,
@@ -345,10 +422,11 @@ async function bootstrap(args: CliArgs): Promise<void> {
     repoRoot: args.repoRoot,
   });
 
-  // 3. Write goal artifacts
+  // 3. Write goal artifacts (per-profile filenames + verify commands)
   const goals = await writeGoalArtifacts({
     repoRoot: args.repoRoot,
     decomposition,
+    profile,
   });
 
   // 4. Initialize state
@@ -366,6 +444,7 @@ async function bootstrap(args: CliArgs): Promise<void> {
     state,
     userGoalText,
     currentGoalId: null,  // dry-run: nothing in flight
+    profile,
   });
   writeFileSync(docPath, doc, "utf-8");
 

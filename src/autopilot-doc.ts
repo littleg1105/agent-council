@@ -17,15 +17,17 @@
  */
 
 import type { AutopilotState, Goal } from "./autopilot-state";
+import type { ProjectProfile } from "./autopilot-profile";
 
 export interface DocContext {
   state: AutopilotState;
   userGoalText: string;
   currentGoalId: string | null;        // explicit highlight in doc; null in dry-run
+  profile: ProjectProfile;             // project type — drives the conventions section
 }
 
 export function renderAutopilotDoc(ctx: DocContext): string {
-  const { state, userGoalText, currentGoalId } = ctx;
+  const { state, userGoalText, currentGoalId, profile } = ctx;
   const total = state.goals.length;
   const done = state.completed.length;
   const failed = state.failed.length;
@@ -61,8 +63,11 @@ ${state.goals.map((g) => formatGoalLine(g, currentGoalId)).join("\n")}
 
 ## Conventions for this project
 
-- Bun + TypeScript. Tests use \`bun:test\` (\`import { describe, test, expect } from "bun:test"\`).
-- Run \`bun test\` to verify. Run \`bun run typecheck\` for types.
+- Project type: **${profile.display_name}** (${profile.language})
+- Test framework: ${profile.test_framework}
+- Run \`${profile.test_command}\` to verify the suite.${
+  profile.typecheck_command ? ` Run \`${profile.typecheck_command}\` for types/lints.` : ""
+}
 - Commit messages: Conventional Commits (\`feat(g3): ...\`, \`fix(g3): ...\`).
 - Per-goal scope is enforced by convention; do not touch files outside what
   your goal requires.

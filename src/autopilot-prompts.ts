@@ -17,6 +17,7 @@
  */
 
 import type { Goal } from "./autopilot-state";
+import type { ProjectProfile } from "./autopilot-profile";
 
 /**
  * Maximum number of leaf goals the council is allowed to produce. From the
@@ -34,8 +35,13 @@ export interface DecompositionGoal {
 /**
  * Build the bootstrap council question that asks for goal decomposition.
  * Each agent produces a complete decomposition; the chairman picks the best one.
+ *
+ * The `profile` parameter parameterizes the prompt so the council writes specs
+ * in the right shape for the target project's language and test framework.
+ * Supported profiles cover TypeScript+Bun, TypeScript+Node, Python+pytest, Go,
+ * Rust, Ruby+RSpec, and a generic fallback (see autopilot-profile.ts).
  */
-export function buildBootstrapPrompt(userGoalText: string): string {
+export function buildBootstrapPrompt(userGoalText: string, profile: ProjectProfile): string {
   return `You are deliberating on how to decompose a user goal into testable leaf goals
 for autonomous implementation. The autopilot will spawn a fresh \`claude -p\`
 subprocess for EACH leaf goal — those subprocesses have no memory of other
@@ -47,12 +53,17 @@ USER GOAL (verbatim):
 ${userGoalText.trim()}
 \`\`\`
 
+PROJECT TYPE: **${profile.display_name}** (${profile.language})
+
+${profile.prompt_language_block}
+
 CONTEXT:
 
 - The autopilot runs autonomously for hours; it cannot ask the user for
   clarification mid-run. Decompose so each leaf is self-contained.
-- Each leaf is verified by running its frozen test spec via \`bun test\`. The
-  done-signal is bun's exit code, not LLM judgment.
+- Each leaf is verified by running its frozen test spec via the project's
+  test runner: \`${profile.test_command}\`. The done-signal is the runner's
+  exit code, not LLM judgment.
 - Specs are FROZEN at decomposition. The implementing subprocess CANNOT edit
   them; a pre-commit hook will reject any change to .council/specs/. So write
   specs that test BEHAVIOR, not implementation details that haven't been
@@ -60,8 +71,13 @@ CONTEXT:
 - Maximum ${MAX_LEAF_GOALS} leaf goals. Fewer is fine. More is rejected.
 - Goals must be ORDERABLE: gN cannot depend on g(N+1). The autopilot will
   process them sequentially.
-- The implementing subprocess uses Bun + TypeScript. Specs use \`bun:test\`
-  syntax (\`import { describe, test, expect } from "bun:test"\`).
+- Spec files use the extension \`${profile.spec_extension}\`.
+
+EXAMPLE SPEC SHAPE (match this for your generated specs):
+
+\`\`\`
+${profile.prompt_spec_example.trim()}
+\`\`\`
 
 YOUR TASK:
 
@@ -73,6 +89,9 @@ EXACTLY these three sections, in this order:
 
 2. **A \`===GOALS===\` block** containing valid JSON with this exact shape.
    The chairman will parse this; deviations from the schema are rejected.
+   The \`spec_content\` value is a JSON-encoded string of a complete spec
+   file in the project's language (see EXAMPLE SPEC SHAPE above) — make sure
+   you JSON-escape newlines as \\n and quotes as \\".
 
 \`\`\`
 ===GOALS===
@@ -81,7 +100,7 @@ EXACTLY these three sections, in this order:
     "id": "g1",
     "title": "Short imperative title",
     "description": "One paragraph explaining what this leaf goal achieves and why it's the right granularity.",
-    "spec_content": "import { describe, test, expect } from \\"bun:test\\";\\n\\ndescribe(\\"g1: title\\", () => {\\n  test(\\"...\\", () => {\\n    expect(...).toBe(...);\\n  });\\n});\\n"
+    "spec_content": "<full spec file content, JSON-escaped>"
   },
   ...
 ]
