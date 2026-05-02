@@ -73,6 +73,32 @@ export interface PreflightStatus {
 export interface AgentAdapter {
   id: AgentId;
   binary: string;
+  /**
+   * Whether `parseOutput` is robust to mid-stream truncation — i.e. produces a
+   * useful (status:"ok", non-empty `response`) result when fed a partial buffer
+   * captured before SIGTERM kills the subprocess.
+   *
+   * `dispatchAgent`'s timeout branch only invokes salvage when this is true.
+   * The asymmetry is deliberate: Codex's JSONL streaming format + per-line
+   * try/catch (parseOutput at the JSONL parser) tolerates a half-written
+   * trailing line and extracts the prior complete `item.completed` events.
+   * Claude and Gemini emit one terminal JSON blob; truncating mid-blob makes
+   * `JSON.parse` throw, and even a "tolerant" parser that extracted the
+   * longest valid prefix would surface text like `'{"result":"the answer is
+   * option A —` as `partial_recommendation: "the answer is option A"` — wrong
+   * but plausible-looking, presented under the viewer's amber "(timed out —
+   * partial recovery)" badge.
+   *
+   * This field is the explicit contract. It replaces PR2's implicit gating
+   * via the exit-code guards in each adapter's parseOutput (adapters.ts:329,
+   * 391, 447) — those guards are still correct individually, but a future
+   * "unify adapter error handling" refactor that standardized them would
+   * silently break salvage. Now the salvage gate is at the use site
+   * (council.ts dispatchAgent timeout branch) and the contract is per-adapter
+   * declarative. A future engineer making Claude tolerant has to deliberately
+   * flip `claudeAdapter.salvagesPartial = true`, which is locally visible.
+   */
+  salvagesPartial: boolean;
   detect(): Promise<boolean>;
   command(prompt: string, repoRoot: string, opts?: DispatchOptions): string[];
   parseOutput(
@@ -319,6 +345,9 @@ function claudeEffortArg(level: EffortLevel): string[] {
 export const claudeAdapter: AgentAdapter = {
   id: "claude",
   binary: "claude",
+  // Claude emits one terminal JSON blob; truncated input makes JSON.parse throw.
+  // Mid-stream salvage would surface plausible-looking but wrong recommendations.
+  salvagesPartial: false,
 
   detect: () => binaryExists("claude"),
 
@@ -373,6 +402,10 @@ function codexEffortArg(level: EffortLevel): string[] {
 export const codexAdapter: AgentAdapter = {
   id: "codex",
   binary: "codex",
+  // Codex emits JSONL; the per-line try/catch in parseOutput tolerates a half-
+  // written trailing line and extracts the prior complete `item.completed`
+  // events. Salvage produces useful partial responses for this adapter.
+  salvagesPartial: true,
 
   detect: () => binaryExists("codex"),
 
@@ -435,6 +468,10 @@ export const codexAdapter: AgentAdapter = {
 export const geminiAdapter: AgentAdapter = {
   id: "gemini",
   binary: "gemini",
+  // Gemini emits one terminal JSON blob (same shape as Claude); truncated
+  // input makes JSON.parse throw. Mid-stream salvage would surface plausible-
+  // looking but wrong recommendations.
+  salvagesPartial: false,
 
   detect: () => binaryExists("gemini"),
 

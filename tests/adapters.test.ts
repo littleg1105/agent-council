@@ -378,6 +378,22 @@ describe("detectAgents", () => {
   });
 });
 
+// --- Salvage contract ---
+
+describe("AgentAdapter.salvagesPartial contract", () => {
+  test("only Codex declares salvagesPartial:true (load-bearing — see council.ts dispatchAgent timeout branch)", () => {
+    // This test is a tripwire. The salvage gate at the dispatchAgent timeout
+    // branch reads `adapter.salvagesPartial`. Flipping any of these to the
+    // wrong value either drops Codex's partial recovery (ok→false) or surfaces
+    // plausible-looking but wrong content from truncated Claude/Gemini blobs
+    // (ok→true). If you intentionally need to change one, update the test in
+    // the same commit so reviewers see the contract change explicitly.
+    expect(claudeAdapter.salvagesPartial).toBe(false);
+    expect(codexAdapter.salvagesPartial).toBe(true);
+    expect(geminiAdapter.salvagesPartial).toBe(false);
+  });
+});
+
 // --- Partial-on-timeout schema ---
 
 describe("AgentResult partial fields", () => {

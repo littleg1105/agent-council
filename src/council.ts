@@ -286,22 +286,28 @@ async function dispatchAgent(
     const durationMs = Date.now() - startTime;
 
     if (timedOut) {
-      // Partial-on-timeout salvage: feed the buffered stdout through the adapter
-      // parser. Codex's tolerant JSONL try/catch already extracts complete events
-      // from a truncated buffer; Claude/Gemini's strict JSON.parse will throw and
-      // return status:"error", in which case we omit the partial fields.
-      const salvaged = adapter.parseOutput(stdout, stderr, -1, durationMs);
-      const hasPartial = salvaged.status === "ok" && salvaged.response.length > 0;
-      if (hasPartial) {
-        console.error(`  ${adapter.id}: salvaged ${salvaged.response.length} bytes of partial response`);
+      // Partial-on-timeout salvage: feed the buffered stdout through parseOutput,
+      // but only for adapters that explicitly declare `salvagesPartial: true`.
+      // Codex's JSONL parser tolerates a truncated trailing line and extracts
+      // prior complete events. Claude and Gemini emit one terminal JSON blob;
+      // even a "tolerant" parser that extracted the longest valid prefix would
+      // surface plausible-looking but wrong content as `partial_recommendation`.
+      // The contract is per-adapter declarative — see AgentAdapter.salvagesPartial.
+      let partial: { response: string; recommendation?: string } | null = null;
+      if (adapter.salvagesPartial) {
+        const salvaged = adapter.parseOutput(stdout, stderr, -1, durationMs);
+        if (salvaged.status === "ok" && salvaged.response.length > 0) {
+          partial = { response: salvaged.response, recommendation: salvaged.recommendation };
+          console.error(`  ${adapter.id}: salvaged ${salvaged.response.length} bytes of partial response`);
+        }
       }
       return {
         agent: adapter.id,
         status: "timeout",
         structured: false,
         response: "",
-        partial_response: hasPartial ? salvaged.response : undefined,
-        partial_recommendation: hasPartial ? salvaged.recommendation : undefined,
+        partial_response: partial?.response,
+        partial_recommendation: partial?.recommendation,
         error: `Agent did not respond within ${timeoutMs / 1000} seconds`,
         error_class: "timeout" as ErrorClass,
         raw_stderr: stderr,
