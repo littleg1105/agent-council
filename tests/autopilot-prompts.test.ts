@@ -251,20 +251,50 @@ describe("buildSynthesizerPrompt", () => {
       "/tmp/sess/stage1/opinion_claude.json",
       "/tmp/sess/stage1/opinion_codex.json",
       "/tmp/sess/stage1/opinion_gemini.json",
-    ]);
+    ], PROFILE_TYPESCRIPT_BUN);
     expect(out).toContain("opinion_claude.json");
     expect(out).toContain("opinion_codex.json");
     expect(out).toContain("opinion_gemini.json");
   });
 
   test("instructs the synthesizer to emit verbatim GOALS block", () => {
-    const out = buildSynthesizerPrompt(["/x"]);
+    const out = buildSynthesizerPrompt(["/x"], PROFILE_TYPESCRIPT_BUN);
     expect(out).toContain("===GOALS===");
     expect(out).toContain("verbatim");
   });
 
   test("provides the no-viable-decomposition fallback marker", () => {
-    const out = buildSynthesizerPrompt(["/x"]);
+    const out = buildSynthesizerPrompt(["/x"], PROFILE_TYPESCRIPT_BUN);
     expect(out).toContain("===NO_VIABLE_DECOMPOSITION===");
+  });
+});
+
+describe("buildSynthesizerPrompt — profile-aware (PR9 follow-up)", () => {
+  test("Python profile: validity criterion mentions Python+pytest, not TypeScript", () => {
+    const out = buildSynthesizerPrompt(["/x"], PROFILE_PYTHON_POETRY);
+    expect(out).toContain("Python");
+    expect(out).toContain("pytest");
+    expect(out).not.toContain("TypeScript using `bun:test`");
+    expect(out).not.toContain("TypeScript using bun:test");
+  });
+
+  test("Go profile: validity criterion mentions Go and go test as the TARGET language", () => {
+    const out = buildSynthesizerPrompt(["/x"], PROFILE_GO);
+    expect(out).toContain("Language:       Go");
+    expect(out).toContain("Test framework: go test");
+    expect(out).toContain("Go code that the go test runner");
+  });
+
+  test("Rust profile: validity criterion mentions Rust+cargo as the TARGET language", () => {
+    const out = buildSynthesizerPrompt(["/x"], PROFILE_RUST);
+    expect(out).toContain("Language:       Rust");
+    expect(out).toContain("Test framework: cargo test");
+    expect(out).toContain("Rust code that the cargo test runner");
+  });
+
+  test("TypeScript+Bun profile: validity criterion correctly mentions TS+Bun", () => {
+    const out = buildSynthesizerPrompt(["/x"], PROFILE_TYPESCRIPT_BUN);
+    expect(out).toContain("TypeScript");
+    expect(out).toContain("bun:test");
   });
 });

@@ -275,16 +275,29 @@ Begin by reading the three files listed above, then start implementing.
  * the autopilot invokes a fresh `claude -p` with this prompt to pick the
  * best one and emit the chosen GOALS block to stdout.
  *
+ * The `profile` parameter parameterizes the validity criterion so the
+ * synthesizer judges specs against the active project's language and test
+ * framework — Python+pytest projects don't get rejected for "not being
+ * TypeScript". (This was a PR9 leak fixed after the autopilot's first
+ * cross-architecture run on a Python project.)
+ *
  * Why a separate synthesizer instead of a chairman: the standard chairman
  * flow runs in the same Claude Code session that invoked /agent-council. The
  * autopilot is a Bun process, so there's no parent Claude session to be
  * chairman. A dedicated synthesizer call is the cleanest way to do
  * structured-output picking.
  */
-export function buildSynthesizerPrompt(opinionFilePaths: string[]): string {
+export function buildSynthesizerPrompt(opinionFilePaths: string[], profile: ProjectProfile): string {
   const fileList = opinionFilePaths.map((p, i) => `  ${i + 1}. ${p}`).join("\n");
   return `You are the chairman synthesizing 3 council opinions on a goal-decomposition
-question for an autopilot. Read each opinion file:
+question for an autopilot. The target project's profile is:
+
+  Language:       ${profile.language}
+  Test framework: ${profile.test_framework}
+  Spec extension: ${profile.spec_extension}
+  Test command:   ${profile.test_command}
+
+Read each opinion file:
 
 ${fileList}
 
@@ -297,7 +310,10 @@ Your job:
    b. Goal boundaries are clean (each leaf is self-contained, orderable).
    c. Specs are not over-mocked (real behavior exercised).
    d. Reasonable count (3-${MAX_LEAF_GOALS} leaves; closer to 5 is usually right).
-   e. Spec content is syntactically valid TypeScript using \`bun:test\`.
+   e. Spec content is syntactically valid for the project profile above —
+      i.e. ${profile.language} code that the ${profile.test_framework} runner
+      can execute. Reject specs that use the wrong language/framework
+      (a TypeScript spec for a Python project, etc.).
 3. Pick the SINGLE best decomposition. You may NOT merge or hybridize — pick
    one agent's output verbatim. Hybridizing risks introducing inconsistencies
    that breaks the autopilot's parser.

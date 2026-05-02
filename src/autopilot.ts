@@ -309,6 +309,7 @@ async function dispatchBootstrapCouncil(args: {
 async function runSynthesizer(args: {
   sessionDir: string;
   repoRoot: string;
+  profile: ProjectProfile;
 }): Promise<DecompositionGoal[]> {
   const opinionFiles = ["claude", "codex", "gemini"]
     .map((id) => resolve(args.sessionDir, "stage1", `opinion_${id}.json`))
@@ -317,7 +318,7 @@ async function runSynthesizer(args: {
     throw new Error(`no opinion files found in ${args.sessionDir}/stage1/`);
   }
 
-  const prompt = buildSynthesizerPrompt(opinionFiles);
+  const prompt = buildSynthesizerPrompt(opinionFiles, args.profile);
   console.error(`[autopilot] Synthesizing decomposition from ${opinionFiles.length} opinions...`);
 
   // Use claude -p to read the opinion files and emit the chosen GOALS block.
@@ -469,10 +470,12 @@ async function bootstrap(args: CliArgs): Promise<void> {
     repoRoot: args.repoRoot,
   });
 
-  // 2. Synthesize decomposition
+  // 2. Synthesize decomposition (profile-aware so the synthesizer judges specs
+  //    against the right language/framework — not a hardcoded TypeScript bias)
   const decomposition = await runSynthesizer({
     sessionDir,
     repoRoot: args.repoRoot,
+    profile,
   });
 
   // 3. Write goal artifacts (per-profile filenames + verify commands)
@@ -511,7 +514,10 @@ async function bootstrap(args: CliArgs): Promise<void> {
   }
   console.error("");
   console.error(`  Goal files:    ${resolve(autopilotDir, "goals")}/g*.md`);
-  console.error(`  Test specs:    ${resolve(args.repoRoot, ".council", "specs")}/g*.test.ts`);
+  // Use the profile's spec_filename to render an accurate glob pattern
+  // (e.g. test_g*.py for Python, g*_test.go for Go, g*.test.ts for TypeScript).
+  const specGlob = profile.spec_filename("g*");
+  console.error(`  Test specs:    ${resolve(args.repoRoot, ".council", "specs")}/${specGlob}`);
   console.error(`  State:         ${resolve(autopilotDir, "state.json")}`);
   console.error(`  Project doc:   ${docPath}`);
   console.error("");
