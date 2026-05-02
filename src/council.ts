@@ -1012,6 +1012,75 @@ async function runNudge(
 
 // --- CLI Arg Parsing ---
 
+function printCouncilHelp(): void {
+  console.error(`agent-council — convene 3 CLI AI agents (Claude, Codex, Gemini) for multi-agent deliberation
+
+USAGE
+
+  council --question-file <path> [options]                  Run a deliberation
+  council list                                              List past sessions
+  council replay <session-id>                               Replay a past session in terminal
+  council revisit <session-id> [options]                    Re-run with current context
+  council outcome <session-id> --result "<text>"            Record outcome
+  council regenerate-viewer <session-id>                    Rebuild the HTML viewer
+  council nudge <session-id> --agent <id> --correction "<text>"   Challenge an agent's assumption
+
+OPTIONS — main 'run' subcommand
+
+  --question-file <path>     Markdown/text file containing the question (required)
+  --chairman <agent>         claude | codex | gemini  (default: auto-detect from invoking CLI)
+  --project <slug>           Project name for storage (default: basename of git root or cwd)
+  --with-review              Run Stage 2 peer review (mode: thorough)
+  --quick                    Run with shorter timeouts and lower effort (mode: quick)
+  --context <files>          Comma-separated repo-relative file paths to bundle as context
+  --skip-preflight           Skip the per-agent health probe (faster startup)
+  --effort <level>           max | high | medium | low | off  (one-run override)
+  --unbounded                Disable per-agent timeouts (~24-day cap; use only with care)
+
+DEFAULTS BY MODE
+
+  quick     timeouts 180s · effort: high · grace: 180s
+  fast      timeouts 600s · effort: max  · grace: 600s   (default)
+  thorough  timeouts 900s · effort: max  · grace: 900s   (--with-review)
+
+CONFIG FILE — ~/.council/config.json (all fields optional)
+
+  {
+    "models":          { "claude": "opus", "codex": "gpt-5.4", "gemini": "" },
+    "timeout_ms":      { "claude": 600000, "codex": 600000, "gemini": 600000 },
+    "quorum_grace_ms": 600000,
+    "effort":          "max",
+    "proactive":       false
+  }
+
+  - models: per-agent CLI model. Empty string lets the CLI pick its tier-default.
+  - timeout_ms: number (applied to all) OR per-agent object.
+  - effort: string (applied to all) OR per-agent object.
+  - User config wins over mode defaults; CLI flags win over both.
+
+STORAGE
+
+  ~/.council/<project>/<session-id>/   Per-session directory (meta.json, stage1/, synthesis.json, viewer.html)
+
+EXAMPLES
+
+  council --question-file q.md --project myapp                   # fast/max default
+  council --question-file q.md --quick                           # cheap probe
+  council --question-file q.md --with-review --effort max        # full deliberation
+  council --question-file q.md --unbounded                       # no time cap (long architectural Qs)
+  council list --project myapp
+  council replay council-20260502-185738
+  council nudge council-20260502-185738 --agent codex --correction "Cost is not a concern"
+
+LEARN MORE
+
+  CLAUDE.md             — architecture notes for AI assistants
+  README.md             — project overview, install, use cases
+  docs/autopilot.md     — long-running autonomous loop on top of the council
+  docs/profiles.md      — multi-architecture project profiles for the autopilot
+`);
+}
+
 function parseArgs(): {
   command: "run" | "list" | "replay" | "revisit" | "outcome" | "regenerate-viewer" | "nudge";
   chairman: AgentId;
@@ -1028,6 +1097,12 @@ function parseArgs(): {
   unbounded: boolean;
 } {
   const args = process.argv.slice(2);
+
+  // --help / -h: print and exit before any subcommand parsing
+  if (args.includes("--help") || args.includes("-h") || args[0] === "help") {
+    printCouncilHelp();
+    process.exit(0);
+  }
 
   // Subcommands
   if (args[0] === "list") {

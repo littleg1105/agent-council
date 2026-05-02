@@ -108,13 +108,23 @@ function parseArgs(argv: string[]): CliArgs {
 }
 
 function printHelp(): void {
-  console.error(`Usage: autopilot --goal <goal.md> [options]
+  console.error(`autopilot — autonomous-loop orchestrator built on top of agent-council
 
-Options:
-  --goal, -g <path>        User-supplied goal markdown file
+Decomposes a user-supplied goal into testable leaf goals via a multi-agent
+council, writes frozen test specs in the project's native test format, and
+(in live mode — not yet shipping) spawns fresh \`claude -p\` subprocesses to
+implement each leaf against its spec.
+
+USAGE
+
+  autopilot --goal <goal.md> [options]
+
+OPTIONS
+
+  --goal, -g <path>        User-supplied goal markdown file (required unless --resume)
   --repo, -r <path>        Repo root (default: cwd)
-  --dry-run                Bootstrap only — decompose, write specs, exit (default)
-  --live                   Run the full implementation loop (PR9; not yet shipping)
+  --dry-run                Bootstrap only — decompose, write specs, exit (DEFAULT)
+  --live                   Run the implementation loop (PR9 — not yet shipping)
   --resume                 Resume from existing .autopilot/state.json
   --reset                  Wipe .autopilot/ and start fresh
   --council-bin <path>     Override path to council binary (default: autodetect)
@@ -123,26 +133,69 @@ Options:
   --profile-file <path>    Load a custom profile from JSON (for stacks not covered above)
   --help, -h               Show this help
 
-Project profile auto-detection (override with --profile or --profile-file):
-  pyproject.toml + poetry  → python-poetry
-  pyproject.toml / setup.py → python-pytest
-  package.json + bun       → typescript-bun
-  package.json + vitest    → typescript-node
-  package.json + jest      → typescript-jest
-  go.mod                   → go
-  Cargo.toml               → rust
-  Gemfile + rspec          → ruby-rspec
-  (none of the above)      → generic (fallback; user should configure)
+PROJECT PROFILE AUTO-DETECTION
 
-Files written under <repo>/.autopilot/:
-  state.json               Orchestrator state (compaction-survivable)
-  AUTOPILOT.md             Project context (regenerated each spawn)
-  goals/g<N>.md            Per-leaf goal files (frozen at decomposition)
-  notes/g<N>-attempts.md   Failure notes when a goal gets stuck (live mode only)
+  pyproject.toml + poetry        → python-poetry        (poetry run pytest)
+  pyproject.toml / setup.py      → python-pytest        (pytest)
+  package.json + bun             → typescript-bun       (bun test)
+  package.json + vitest          → typescript-node      (npx vitest run)
+  package.json + jest            → typescript-jest      (npx jest)
+  go.mod                         → go                   (go test)
+  Cargo.toml                     → rust                 (cargo test)
+  Gemfile + rspec                → ruby-rspec           (bundle exec rspec)
+  (none of the above)            → generic              (manual config required)
 
-Files written under <repo>/.council/specs/:
-  g<N>.<spec_ext>          Frozen test specs in the project's native format
-                           (.test.ts for TS, _test.py for Python, etc.)
+  Override with --profile <id> or --profile-file <custom.json>.
+
+FILES WRITTEN
+
+  <repo>/.autopilot/state.json          Orchestrator state (compaction-survivable, gitignored)
+  <repo>/.autopilot/AUTOPILOT.md         Project context (regenerated each spawn in live mode)
+  <repo>/.autopilot/goals/g<N>.md        Per-leaf goal files (frozen at decomposition)
+  <repo>/.autopilot/notes/g<N>-*.md      Failure notes (live mode only)
+  <repo>/.council/specs/g<N>.<ext>       Frozen test specs in the project's native format
+                                          (.test.ts for TS, test_*.py for Python, *_test.go for
+                                          Go, *_test.rs for Rust, *_spec.rb for Ruby)
+
+EXAMPLES
+
+  # Bootstrap a TypeScript+Bun project (auto-detected from package.json + bun.lock)
+  autopilot --goal goal.md
+
+  # Bootstrap a Python+Poetry project (auto-detected from pyproject.toml [tool.poetry])
+  autopilot --goal goal.md --repo /path/to/python-project
+
+  # Force a specific profile (override auto-detect)
+  autopilot --goal goal.md --profile python-pytest
+
+  # Use a custom profile (e.g. Elixir+Mix)
+  autopilot --goal goal.md --profile-file ./elixir-mix.json
+
+  # Wipe and re-bootstrap with a new goal
+  autopilot --goal goal.md --reset
+
+WORKFLOW (DRY-RUN)
+
+  1. You write goal.md describing what you want built (see goal-template.md).
+  2. autopilot detects the project profile (or you pass --profile).
+  3. autopilot dispatches the council (3 agents in parallel, max-effort) to
+     decompose the goal into 3-8 leaf goals + frozen test specs in the
+     project's native test framework.
+  4. A synthesizer pass picks the best decomposition and writes:
+       - .autopilot/goals/g<N>.md   (one file per leaf goal)
+       - .council/specs/g<N>.<ext>  (frozen test specs — DO NOT EDIT)
+       - .autopilot/state.json      (orchestrator state)
+       - .autopilot/AUTOPILOT.md    (project context for spawned subprocesses)
+  5. autopilot prints a summary and exits.
+  6. You review the specs. If they're wrong: --reset and rephrase the goal.
+     If they're right: (live mode, future PR) re-run with --live.
+
+LEARN MORE
+
+  docs/autopilot.md     — full guide, architecture, fake-progress defenses
+  docs/profiles.md      — profile system, supported architectures, custom profiles
+  README.md             — project overview, install
+  CLAUDE.md             — architecture notes for AI assistants
 `);
 }
 

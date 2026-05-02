@@ -166,28 +166,49 @@ bin/council --question-file question.txt --project myapp --skip-preflight
 
 ## Configuration
 
-Create `~/.council/config.json` to customize models, timeouts, and quorum behavior:
+Create `~/.council/config.json` to customize models, timeouts, effort, and quorum behavior. **All fields are optional.**
 
-```json
+```jsonc
 {
+  // Per-agent CLI model. Empty string ("") = let the CLI pick its tier-default.
+  // Recommended for autopilot/long-running sessions; optional for interactive use.
   "models": {
-    "claude": "claude-opus-4-6",
-    "codex": "gpt-5.4",
-    "gemini": "gemini-3.1-pro"
+    "claude": "opus",        // alias resolves to latest Opus on your subscription
+    "codex":  "gpt-5.4",     // exact name; tier-dependent
+    "gemini": ""             // empty: let Gemini CLI pick (verify before pinning)
   },
+
+  // Per-agent timeout in ms. Number (applied to all) OR per-agent object.
   "timeout_ms": {
-    "claude": 120000,
-    "codex": 120000,
-    "gemini": 180000
+    "claude": 600000,
+    "codex":  600000,
+    "gemini": 600000
   },
-  "quorum_grace_ms": 30000
+
+  // Once enough agents respond (quorum), stragglers get this grace window. The
+  // runtime clamps grace to never expire before any pending agent's own timeout.
+  "quorum_grace_ms": 600000,
+
+  // Reasoning effort. String OR per-agent object. Valid: max|high|medium|low|off.
+  // Mode defaults: quick=high, fast=max, thorough=max.
+  "effort": "max",
+
+  // Set false to disable proactive /council suggestions in interactive sessions.
+  "proactive": true
 }
 ```
 
-All fields are optional. Missing fields use the defaults shown above.
+Mode defaults (no config file needed):
 
-- **timeout_ms**: Per-agent timeout in milliseconds. Gemini defaults to 180s (it's slower). Can also be a single number applied to all agents.
-- **quorum_grace_ms**: Once enough agents respond (quorum), stragglers get this grace window before the council proceeds without them. Default: 30s.
+| Mode | Effort | Timeout | Grace |
+|---|---|---|---|
+| `quick` | high | 180s | 180s |
+| `fast` (default) | max | 600s | 600s |
+| `thorough` (`--with-review`) | max | 900s | 900s |
+
+CLI flags `--effort <max|high|medium|low|off>` and `--unbounded` (no time cap) override per-run.
+
+**Full config reference:** [`docs/configuration.md`](./docs/configuration.md).
 
 ## Storage
 
@@ -241,12 +262,56 @@ Suggestions are quiet (a single line after the response), max 2 per session, and
 { "proactive": false }
 ```
 
+## Autopilot — autonomous loops on top of the council
+
+For multi-hour autonomous work, agent-council ships an **autopilot** that decomposes a user goal into testable leaf goals (via the council), then (in live mode, future PR) spawns fresh `claude -p` subprocesses per leaf to implement against frozen test specs.
+
+```bash
+# 1. Write a goal
+cp goal-template.md goal.md
+$EDITOR goal.md
+
+# 2. Bootstrap (auto-detects project type from manifest files)
+bun run bin/autopilot --goal goal.md
+
+# 3. Inspect what the council planned
+ls .autopilot/goals/        # human-readable leaf goal descriptions
+ls .council/specs/          # frozen test specs in your project's native test format
+cat .autopilot/AUTOPILOT.md # project context for spawned subprocesses
+
+# 4. If wrong: --reset and rephrase. If right: --live (future PR) runs implementation.
+```
+
+**Architecture:**
+- **Strategy C** (test-as-brain): done-signal is the test runner's exit code, not LLM judgment. Implementation Claude can't edit the spec — pre-commit hook + clean-checkout verifier defend against fake progress.
+- **Council can VETO but never BLESS**: final-review council (PR9) can deny `done` but can't grant it. Truth flows from `bun test`, not consensus.
+- **One stuck-rescue council per goal**, then rollback to last green and advance. No paging; failures land in `FAILED_GOALS.md`.
+- **Repo-local state** at `<repo>/.autopilot/state.json` (gitignored, atomic writes, compaction-survivable).
+- **Auto-pause-and-resume across rate-limit windows** (no per-token cost; bounded by subscription quotas).
+
+**Multi-architecture support.** The autopilot detects your project's language/test framework from manifest files and writes specs in the right format. Built-in profiles for **TypeScript+Bun**, **TypeScript+Node (Vitest/Jest)**, **Python+Poetry**, **Python+pytest**, **Go**, **Rust**, **Ruby+RSpec**, with a generic fallback. Custom profiles via `--profile-file <json>` for stacks like Elixir+Mix.
+
+```
+pyproject.toml + poetry.lock  → python-poetry
+package.json + bun.lock       → typescript-bun
+Cargo.toml                    → rust
+... (full list: docs/profiles.md)
+```
+
+Override auto-detection: `--profile <id>` or `--profile-file <path>`.
+
+**Detailed docs:**
+- [`docs/autopilot.md`](./docs/autopilot.md) — full guide, architecture, fake-progress defenses
+- [`docs/profiles.md`](./docs/profiles.md) — profile reference, custom profile JSON
+- [`docs/configuration.md`](./docs/configuration.md) — `~/.council/config.json` field reference
+
 ## Use Cases
 
 - **Architecture decisions:** "Postgres vs DynamoDB for event sourcing at 10k events/sec?"
 - **Code review:** "Review this auth middleware for security issues"
 - **Debugging:** "Our API latency spiked 3x after commit abc123. Most likely cause?"
 - **Technology selection:** "Compare BullMQ, Agenda, and bee-queue for our Node.js job queue"
+- **Long-running implementation work** (autopilot): "Build a CSV→Parquet converter with property tests"
 - **General questions:** Works for any question, not just engineering
 
 ## What This Is Not
