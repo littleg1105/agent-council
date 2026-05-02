@@ -50,6 +50,7 @@ import {
   type StuckHistory,
   type StuckTrigger,
 } from "./autopilot-stuck";
+import { installSignalHandlers, readAndConsumeControl } from "./autopilot-control";
 import {
   defaultState,
   fileHash,
@@ -581,6 +582,9 @@ async function runLiveMode(args: {
   /** Council binary path. Auto-detected by caller; passed through for testability. */
   councilBin: string;
 }): Promise<LiveResult> {
+  // PR9.3: install SIGINT/SIGTERM handlers for clean ctrl-C
+  const signalReceived = installSignalHandlers();
+
   // Install the pre-commit hook (load-bearing frozen-spec defense).
   const hookResult = installPreCommitHook(args.repoRoot);
   if (hookResult === "no-git") {
@@ -596,6 +600,18 @@ async function runLiveMode(args: {
   // Process goals in queue order. Each goal: spawn-verify-loop until green
   // or iteration cap.
   while (args.state.queue.length > 0) {
+    // PR9.3: check for user-issued control commands (.autopilot/control.json)
+    // and OS signals BEFORE starting each goal. Acting at goal boundaries is
+    // safer than mid-iteration (state is consistent; nothing in flight).
+    const userInterrupt = checkUserInterrupt(args.autopilotDir, signalReceived);
+    if (userInterrupt) {
+      console.error(`[autopilot] user interrupt: ${userInterrupt.kind} (${userInterrupt.reason ?? "no reason given"})`);
+      args.state.paused_reason = "user_pause";
+      args.state.paused_until = null;  // user-paused has no auto-resume time
+      await writeState(args.autopilotDir, args.state);
+      return { status: "user_paused", completed: args.state.completed, failed: args.state.failed };
+    }
+
     const goalId = args.state.queue[0];
     const goal = args.state.goals.find((g) => g.id === goalId);
     if (!goal) {
@@ -979,6 +995,29 @@ If you've tried the suggestion and it doesn't work, append your reasoning to
 
   console.error(`[autopilot]     rescue notes written: ${notesPath}`);
   return "rescued";
+}
+
+/**
+ * Check both interruption mechanisms (PR9.3): control.json file and OS
+ * signals. Returns the source of interruption if any.
+ *
+ * Polling is at goal boundaries (not mid-iteration) so state is always
+ * consistent at the point we'd save and exit.
+ */
+function checkUserInterrupt(
+  autopilotDir: string,
+  signalReceived: () => "SIGINT" | "SIGTERM" | null
+): { kind: string; reason?: string } | null {
+  // Check OS signals first (cheaper)
+  const sig = signalReceived();
+  if (sig) return { kind: `os-signal:${sig}`, reason: "user pressed ctrl-C or sent kill" };
+
+  // Check control.json
+  const control = readAndConsumeControl(autopilotDir);
+  if (control) {
+    return { kind: `control:${control.command}`, reason: control.reason };
+  }
+  return null;
 }
 
 async function rollbackToCommit(repoRoot: string, commit: string): Promise<void> {
