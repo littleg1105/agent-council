@@ -8,7 +8,13 @@ Multi-agent deliberation tool. Convenes Claude Code, Codex CLI, and Gemini CLI t
 - `src/adapters.ts` — Agent adapters (Claude, Codex, Gemini) + shared types (SessionMeta, AgentResult)
 - `src/prompts.ts` — Stage 1, 2, 3, 4 (nudge) prompt templates
 - `src/viewer.ts` — Self-contained HTML viewer generation (verdict-first, progressive depth, light/dark mode)
+- `src/autopilot.ts` — Autonomous-loop orchestrator (Strategy C from council-20260502-185738). Decomposes a user goal via the council, spawns fresh `claude -p` subprocesses per leaf goal in live mode (PR9). PR8 ships dry-run only.
+- `src/autopilot-state.ts` — `.autopilot/state.json` schema + atomic I/O. Repo-local, gitignored, compaction-survivable.
+- `src/autopilot-prompts.ts` — Bootstrap council prompt + per-goal implementation prompt + synthesizer prompt.
+- `src/autopilot-doc.ts` — Generator for `.autopilot/AUTOPILOT.md` (regenerated per spawn in live mode).
+- `src/autopilot-rate-limit.ts` — Per-CLI rate-limit detector (Claude/Codex/Gemini stderr parsers). PR8 ships the parser; PR9 wires it into auto-pause-and-resume.
 - `bin/council` — Bun entry script
+- `bin/autopilot` — Bun entry script for the autopilot orchestrator
 - `skills/claude-code/` — SKILL.md files for all slash commands (cross-platform compatible)
 - `eval/` — Benchmark framework (10 questions, run-eval.ts)
 

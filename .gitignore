@@ -6,3 +6,5 @@ bin/council-bin
 .gstack/
 .omx/
 .gemini/
+.autopilot/
+
