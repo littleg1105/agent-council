@@ -8,7 +8,13 @@ Multi-agent deliberation tool. Convenes Claude Code, Codex CLI, and Gemini CLI t
 - `src/adapters.ts` — Agent adapters (Claude, Codex, Gemini) + shared types (SessionMeta, AgentResult)
 - `src/prompts.ts` — Stage 1, 2, 3, 4 (nudge) prompt templates
 - `src/viewer.ts` — Self-contained HTML viewer generation (verdict-first, progressive depth, light/dark mode)
-- `src/autopilot.ts` — Autonomous-loop orchestrator (Strategy C from council-20260502-185738). Decomposes a user goal via the council, spawns fresh `claude -p` subprocesses per leaf goal in live mode (PR9). PR8 ships dry-run only.
+- `src/autopilot.ts` — Autonomous-loop orchestrator (Strategy C from council-20260502-185738; live-mode forks from council-20260502-205303). Bootstrap (dry-run) decomposes a user goal via the council and writes frozen specs. Live mode spawns fresh `claude -p` per leaf goal, runs profile.test_command in a clean worktree to verify, advances on green or invokes one stuck-rescue council on stuck. After all leaves green, runs a final-review council with VETO-only authority (4 reject codes only).
+- `src/autopilot-verifier.ts` — Clean-checkout verifier. `git worktree add` + symlinked deps + sanitized env (no API keys) + run profile.spec_test_command. Defeats "agent mocked the test runner" cheats.
+- `src/autopilot-spawn.ts` — Wraps `claude -p` with a per-profile permission allowlist (Read/Write/Edit + git status/diff/add/commit + read-only inspection + the profile's test runner; denies destructive git, network, package installers). Returns rate-limit signal for orchestrator.
+- `src/autopilot-stuck.ts` — Per-profile failure-signature extractors (pytest, bun:test, vitest, jest, go test, cargo test, rspec) + weighted stuck heuristic (Fork 3C: same-failure × git-advanced PRIMARY, 30min-no-green BACKSTOP, tree-unchanged-3-cycles LIVENESS).
+- `src/autopilot-control.ts` — `.autopilot/control.json` reader (pause/stop commands; replan rejected) + SIGINT/SIGTERM handlers polled at goal boundaries.
+- `src/autopilot-review.ts` — Final-review council prompt + per-agent VERDICT_VETO/VERDICT_OK marker parser + 4-code synthesizer (SPEC_MISMATCH > PLACEHOLDER_LOGIC > TEST_ONLY_CHEAT > SCOPE_BREACH severity order).
+- `src/autopilot-hook.ts` — Pre-commit hook installer (load-bearing frozen-spec defense). Bash script that reads .autopilot/state.json's frozen spec_file paths and rejects any commit that modifies them. Idempotent; preserves user-authored hooks.
 - `src/autopilot-state.ts` — `.autopilot/state.json` schema + atomic I/O. Repo-local, gitignored, compaction-survivable.
 - `src/autopilot-prompts.ts` — Bootstrap council prompt + per-goal implementation prompt + synthesizer prompt.
 - `src/autopilot-doc.ts` — Generator for `.autopilot/AUTOPILOT.md` (regenerated per spawn in live mode).

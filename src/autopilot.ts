@@ -52,6 +52,15 @@ import {
 } from "./autopilot-stuck";
 import { installSignalHandlers, readAndConsumeControl } from "./autopilot-control";
 import {
+  buildFinalReviewPrompt,
+  bundleSpecs,
+  computeRunDiff,
+  parseAgentVerdict,
+  synthesizeVerdict,
+  writeReviewArtifact,
+  type VetoVerdict,
+} from "./autopilot-review";
+import {
   defaultState,
   fileHash,
   goalId,
@@ -567,10 +576,12 @@ const EX_TEMPFAIL = 75;     // sysexits — temporary failure (rate-limited; res
 const EX_USER_PAUSE = 130;  // SIGINT-like — user explicitly paused
 
 interface LiveResult {
-  status: "all_done" | "all_failed" | "partial" | "rate_limited" | "user_paused";
+  status: "all_done" | "all_failed" | "partial" | "rate_limited" | "user_paused" | "vetoed";
   completed: string[];
   failed: string[];
   pausedUntil?: string;
+  /** PR9.4: present when status === "vetoed". */
+  veto?: VetoVerdict;
 }
 
 async function runLiveMode(args: {
@@ -661,7 +672,32 @@ async function runLiveMode(args: {
     await writeState(args.autopilotDir, args.state);
   }
 
-  // All goals processed.
+  // All goals processed. PR9.4 — run the final-review council if at least
+  // one goal completed (no point reviewing an empty diff).
+  if (args.state.completed.length > 0) {
+    console.error("");
+    console.error("[autopilot] === Final review council (PR9.4 — VETO-only) ===");
+    const veto = await runFinalReview({
+      state: args.state,
+      autopilotDir: args.autopilotDir,
+      repoRoot: args.repoRoot,
+      profile: args.profile,
+      userGoalText: args.userGoalText,
+      councilBin: args.councilBin,
+    });
+    if (veto.vetoed) {
+      console.error(`[autopilot] ⛔ FINAL REVIEW VETOED: ${veto.code}`);
+      console.error(`[autopilot] Reasoning written to .autopilot/FINAL_REVIEW_VETO.md`);
+      return {
+        status: "vetoed",
+        completed: args.state.completed,
+        failed: args.state.failed,
+        veto,
+      };
+    }
+    console.error(`[autopilot] ✓ Final review approved (verifier-pass + council non-objection)`);
+  }
+
   if (args.state.failed.length === 0) {
     return { status: "all_done", completed: args.state.completed, failed: [] };
   }
@@ -669,6 +705,91 @@ async function runLiveMode(args: {
     return { status: "all_failed", completed: [], failed: args.state.failed };
   }
   return { status: "partial", completed: args.state.completed, failed: args.state.failed };
+}
+
+/**
+ * Final-review council (PR9.4 — Fork 4A). Runs after all leaves have hit
+ * their per-leaf verifier success state. The council can VETO with one of
+ * the 4 reject codes (SPEC_MISMATCH / PLACEHOLDER_LOGIC / TEST_ONLY_CHEAT /
+ * SCOPE_BREACH); it cannot grant `done` (only the verifier does that).
+ *
+ * Fail-fast policy: if vetoed, the run terminates non-zero immediately.
+ * No auto-rescue at the run level. The user wakes up to FINAL_REVIEW_VETO.md
+ * with the council's reasoning and decides what to do.
+ */
+async function runFinalReview(args: {
+  state: AutopilotState;
+  autopilotDir: string;
+  repoRoot: string;
+  profile: ProjectProfile;
+  userGoalText: string;
+  councilBin: string;
+}): Promise<VetoVerdict> {
+  // Build the diff range from initial commit to last_green_commit
+  const fromCommit = args.state.goals[0]?.green_commit
+    ? `${args.state.goals[0].green_commit}~1`  // commit before first green
+    : null;
+  const toCommit = args.state.last_green_commit ?? "HEAD";
+  const { summary, content } = await computeRunDiff({
+    repoRoot: args.repoRoot,
+    fromCommit,
+    toCommit,
+  });
+
+  const completedGoals = args.state.goals.filter((g) => args.state.completed.includes(g.id));
+  const specs = bundleSpecs(args.repoRoot, completedGoals);
+
+  const prompt = buildFinalReviewPrompt({
+    userGoalText: args.userGoalText,
+    goals: completedGoals,
+    diffSummary: summary,
+    diffContent: content,
+    specsCombined: specs,
+    profile: args.profile,
+  });
+
+  // Dispatch the council. Reuse the bootstrap-council dispatcher.
+  let sessionDir: string | null = null;
+  try {
+    sessionDir = await dispatchBootstrapCouncil({
+      councilBin: args.councilBin,
+      question: prompt,
+      repoRoot: args.repoRoot,
+    });
+  } catch (e: any) {
+    // If the review council itself fails, default to APPROVED (verifier-pass
+    // remains the source of truth). Log so the user knows.
+    console.error(`[autopilot]   final-review dispatch failed: ${e.message}; defaulting to approved`);
+    return {
+      vetoed: false,
+      reasoning: `Final-review council dispatch failed: ${e.message}. Defaulted to verifier-pass authority.`,
+      sessionId: "(none — dispatch failure)",
+    };
+  }
+
+  // Parse each agent's verdict marker
+  const stage1 = resolve(sessionDir, "stage1");
+  const perAgent = ["claude", "codex", "gemini"].map((id) => {
+    const path = resolve(stage1, `opinion_${id}.json`);
+    if (!existsSync(path)) return null;
+    try {
+      const op = JSON.parse(readFileSync(path, "utf-8"));
+      if (op.status !== "ok" || typeof op.response !== "string") return null;
+      return parseAgentVerdict(op.response);
+    } catch {
+      return null;
+    }
+  });
+
+  const synth = synthesizeVerdict(perAgent);
+  const verdict: VetoVerdict = {
+    vetoed: synth.vetoed,
+    code: synth.code,
+    reasoning: synth.reasoning,
+    sessionId: sessionDir.split("/").pop() ?? "(unknown)",
+  };
+  writeReviewArtifact({ autopilotDir: args.autopilotDir, verdict });
+  return verdict;
 }
 
 /**
@@ -1102,6 +1223,7 @@ async function main(): Promise<void> {
     const result = await runResume(args);
     if (result.status === "rate_limited") process.exit(EX_TEMPFAIL);
     if (result.status === "user_paused") process.exit(EX_USER_PAUSE);
+    if (result.status === "vetoed") process.exit(2);
     if (result.status === "all_failed") process.exit(1);
     return;
   }
@@ -1131,8 +1253,13 @@ async function main(): Promise<void> {
     console.error(`[autopilot] Live mode finished: ${result.status}`);
     console.error(`[autopilot]   completed: ${result.completed.length} (${result.completed.join(", ") || "(none)"})`);
     console.error(`[autopilot]   failed:    ${result.failed.length} (${result.failed.join(", ") || "(none)"})`);
+    if (result.status === "vetoed" && result.veto) {
+      console.error(`[autopilot]   VETOED:    ${result.veto.code} (see .autopilot/FINAL_REVIEW_VETO.md)`);
+    }
 
     if (result.status === "rate_limited") process.exit(EX_TEMPFAIL);
+    if (result.status === "user_paused") process.exit(EX_USER_PAUSE);
+    if (result.status === "vetoed") process.exit(2);  // distinct from generic failure
     if (result.status === "all_failed") process.exit(1);
   }
 }
