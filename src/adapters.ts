@@ -37,7 +37,7 @@ export interface SessionMeta {
   schema_version?: number;
 }
 
-export type ErrorClass = "auth" | "rate_limit" | "timeout" | "parse" | "startup" | "unknown";
+export type ErrorClass = "auth" | "rate_limit" | "timeout" | "parse" | "startup" | "unknown" | "cancelled";
 
 export interface AgentResult {
   agent: AgentId;
@@ -145,6 +145,7 @@ export function errorClassMessage(errorClass: ErrorClass, agent: AgentId): strin
     case "parse": return `${agent} response was not valid JSON.`;
     case "startup": return `${agent} failed to start. Check installation.`;
     case "unknown": return `${agent} failed.`;
+    case "cancelled": return `${agent} cancelled by quorum grace.`;
   }
 }
 

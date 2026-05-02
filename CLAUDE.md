@@ -21,7 +21,7 @@ Fixtures: `tests/fixtures/` — real CLI output from Claude, Codex, Gemini
 ## Key patterns
 
 - `buildContextBundle()` has path traversal protection — validates all file paths
-- `dispatchWithQuorum()` handles parallel agent dispatch with per-agent timeouts and grace windows
+- `dispatchWithQuorum()` handles parallel agent dispatch with per-agent timeouts and grace windows. All cancellation (per-agent timeout, grace expiry, future user-Ctrl-C / streaming-pipeline abort) fans through a single `AbortController` per dispatch via the `DispatchControl` ref. Always tag `abortReason` BEFORE calling `controller.abort()` (the abort listener is `{ once: true }` and runs synchronously — if abort fires first, the resumed code can't classify the cancellation). On grace expiry, the orchestrator sets `abortReason: "grace"` and aborts; dispatchAgent returns `error_class: "cancelled"` (not in `RETRYABLE_ERRORS`, so `dispatchAgentWithRetry` skips retry — prevents orphan-respawn token burn under `--unbounded`). Quorum is final: grace-cancelled agents do NOT salvage even if `salvagesPartial: true`.
 - `writeJson()` is async with atomic rename (write to .tmp, then rename)
 - `detectChairman()` auto-detects invoking CLI from environment signals
 - SKILL.md files use universal binary discovery (checks all CLI skill directories)

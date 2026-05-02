@@ -185,6 +185,36 @@ function loadConfig(mode: CouncilMode = "fast"): CouncilConfig {
 // --- Subprocess dispatch ---
 
 /**
+ * Cancellation tag. Set on `DispatchControl.abortReason` BEFORE calling
+ * `controller.abort()` (race-safety: the abort listener fires synchronously).
+ * The dispatcher reads this to decide post-hoc behavior:
+ *   - "timeout": internal per-agent setTimeout fired → run salvage if adapter supports it
+ *   - "grace":   external abort from dispatchWithQuorum.tryResolve() because
+ *                quorum was reached and grace expired → quorum is final, no salvage
+ *   - "external": reserved for future sources (user Ctrl-C, parent-session cancel,
+ *                streaming-pipeline abort) — currently unused
+ */
+export type AbortReason = "timeout" | "grace" | "external";
+
+/**
+ * Per-dispatch control surface. Replaces the prior `procRef` pattern with a
+ * native AbortController so all cancellation sources fan in through one
+ * primitive. The orchestrator gets a stable reference; on retry, dispatchAgent
+ * replaces `controller` with a fresh one (the orchestrator only reads it
+ * before grace expiry, when only the first attempt is live, so this is safe).
+ *
+ * Always set `abortReason` BEFORE calling `controller.abort()` — the abort
+ * listener inside dispatchAgent runs synchronously with `{ once: true }`,
+ * so if abort() fires first the resumed code reads `null` and can't classify
+ * the cancellation correctly.
+ */
+export interface DispatchControl {
+  proc: ReturnType<typeof Bun.spawn> | null;
+  controller: AbortController | null;
+  abortReason: AbortReason | null;
+}
+
+/**
  * Drain a ReadableStream into a string while updating a byte counter as bytes arrive.
  * Used by the dispatch watchdog to distinguish "agent thinking + producing output"
  * from "agent silent (probably hung)" — see Path C in plan file.
@@ -220,13 +250,13 @@ export function formatByteSize(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(2)}MB`;
 }
 
-async function dispatchAgent(
+export async function dispatchAgent(
   adapter: AgentAdapter,
   prompt: string,
   repoRoot: string,
   timeoutMs: number,
   opts: DispatchOptions = DEFAULT_DISPATCH_OPTIONS,
-  procRef?: { proc: ReturnType<typeof Bun.spawn> | null }
+  control?: DispatchControl
 ): Promise<AgentResult> {
   const startTime = Date.now();
   const cmd = adapter.command(prompt, repoRoot, opts);
@@ -235,7 +265,22 @@ async function dispatchAgent(
     stderr: "pipe",
     cwd: repoRoot,
   });
-  if (procRef) procRef.proc = proc;
+
+  // Per-attempt AbortController. On retry, this REPLACES the prior controller
+  // in the shared `control` ref — the orchestrator only reads `control.controller`
+  // before grace expiry (when only the first attempt is live), so this is safe.
+  const ctl: DispatchControl = control ?? { proc: null, controller: null, abortReason: null };
+  ctl.proc = proc;
+  ctl.controller = new AbortController();
+  ctl.abortReason = null;
+
+  // Single cancellation point: any source (internal timeout, external grace abort,
+  // future streaming abort) sets abortReason then calls controller.abort(); the
+  // listener turns the abort into a SIGTERM exactly once.
+  const onAbort = () => {
+    try { proc.kill("SIGTERM"); } catch {}
+  };
+  ctl.controller.signal.addEventListener("abort", onAbort, { once: true });
 
   // Byte-flow heartbeat: count bytes drained from stdout as they arrive so the
   // watchdog can distinguish "agent producing output" from "agent silent". A
@@ -266,12 +311,13 @@ async function dispatchAgent(
     }
   }, 30_000);
 
-  let timedOut = false;
   let killTimer: ReturnType<typeof setTimeout> | null = null;
   const timer = setTimeout(() => {
-    timedOut = true;
-    proc.kill("SIGTERM");
-    killTimer = setTimeout(() => proc.kill("SIGKILL"), 5000);
+    // Tag-before-abort: the listener will SIGTERM. abortReason set first so
+    // the resumed code below can classify the cancellation correctly.
+    if (ctl.abortReason === null) ctl.abortReason = "timeout";
+    ctl.controller!.abort();
+    killTimer = setTimeout(() => { try { proc.kill("SIGKILL"); } catch {} }, 5000);
   }, timeoutMs);
 
   try {
@@ -285,14 +331,38 @@ async function dispatchAgent(
     clearInterval(watchdog);
     const durationMs = Date.now() - startTime;
 
-    if (timedOut) {
-      // Partial-on-timeout salvage: feed the buffered stdout through parseOutput,
-      // but only for adapters that explicitly declare `salvagesPartial: true`.
+    // Cancellation classification (single dispatcher rule):
+    //
+    //   abortReason === "grace"   → quorum is final. The agent is dead to the
+    //                                council. Return immediately with
+    //                                error_class:"cancelled" so dispatchAgentWithRetry
+    //                                skips retry. NO salvage even if salvagesPartial,
+    //                                because the synthesis already moved on without us.
+    //
+    //   abortReason === "timeout" → internal per-agent timeout fired. Run salvage
+    //                                if the adapter declares salvagesPartial:true
+    //                                (Codex), else return a plain timeout result.
+    //
+    //   abortReason === "external" → reserved (user/streaming/etc.). Treated like
+    //                                "grace" today.
+    if (ctl.abortReason === "grace" || ctl.abortReason === "external") {
+      return {
+        agent: adapter.id,
+        status: "timeout",
+        structured: false,
+        response: "",
+        error: ctl.abortReason === "grace" ? "Cancelled by quorum grace" : "Cancelled (external)",
+        error_class: "cancelled" as ErrorClass,
+        raw_stderr: stderr,
+        duration_ms: durationMs,
+        timestamp: new Date().toISOString(),
+      };
+    }
+
+    if (ctl.abortReason === "timeout") {
+      // Partial-on-timeout salvage. Gated by AgentAdapter.salvagesPartial.
       // Codex's JSONL parser tolerates a truncated trailing line and extracts
-      // prior complete events. Claude and Gemini emit one terminal JSON blob;
-      // even a "tolerant" parser that extracted the longest valid prefix would
-      // surface plausible-looking but wrong content as `partial_recommendation`.
-      // The contract is per-adapter declarative — see AgentAdapter.salvagesPartial.
+      // prior complete events. Claude/Gemini single-blob JSON do not.
       let partial: { response: string; recommendation?: string } | null = null;
       if (adapter.salvagesPartial) {
         const salvaged = adapter.parseOutput(stdout, stderr, -1, durationMs);
@@ -349,10 +419,16 @@ async function dispatchAgentWithRetry(
   timeoutMs: number,
   opts: DispatchOptions = DEFAULT_DISPATCH_OPTIONS,
   retries: number = 1,
-  procRef?: { proc: ReturnType<typeof Bun.spawn> | null }
+  control?: DispatchControl
 ): Promise<AgentResult> {
-  const result = await dispatchAgent(adapter, prompt, repoRoot, timeoutMs, opts, procRef);
+  const result = await dispatchAgent(adapter, prompt, repoRoot, timeoutMs, opts, control);
   if (result.status === "ok" || retries <= 0) return result;
+
+  // "cancelled" (grace expiry / external abort) is non-retryable BY POLICY:
+  // the orchestrator already moved on without us. Even though "cancelled" is
+  // technically a kind of unknown failure, retrying would produce an orphan
+  // subprocess with no consumer (Bug B from council-20260502-175645).
+  if (result.error_class === "cancelled") return result;
 
   // Only retry transient failures
   const ec = result.error_class || "unknown";
@@ -360,7 +436,7 @@ async function dispatchAgentWithRetry(
 
   console.error(`  ${adapter.id} failed (${ec}). Retrying in 3s...`);
   await new Promise((r) => setTimeout(r, 3000));
-  return dispatchAgent(adapter, prompt, repoRoot, timeoutMs, opts, procRef);
+  return dispatchAgent(adapter, prompt, repoRoot, timeoutMs, opts, control);
 }
 
 // --- Stage 1: Independent Opinions (with quorum + grace window) ---
@@ -395,8 +471,11 @@ async function dispatchWithQuorum(
 
   // Track results as they arrive
   const results: (AgentResult | null)[] = new Array(members.length).fill(null);
-  // Per-agent subprocess refs so we can SIGTERM orphans on grace expiry
-  const procRefs: { proc: ReturnType<typeof Bun.spawn> | null }[] = members.map(() => ({ proc: null }));
+  // Per-agent dispatch controls so we can abort orphans on grace expiry. The
+  // controller is null until dispatchAgent populates it; the orchestrator
+  // reads the live controller before grace expiry, when only the first
+  // attempt is in flight.
+  const controls: DispatchControl[] = members.map(() => ({ proc: null, controller: null, abortReason: null }));
   let successCount = 0;
   let completedCount = 0;
   let graceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -410,20 +489,28 @@ async function dispatchWithQuorum(
       if (graceTimer) clearTimeout(graceTimer);
       console.error(`  ${reason}`);
 
-      // SIGTERM any still-running children so they don't orphan-write to closed pipes.
-      // (Council session council-20260501-125017 caught this bug live.)
+      // Abort any still-running children via their AbortController so they fan
+      // through the unified cancellation path. Tag-before-abort: set
+      // abortReason to "grace" BEFORE controller.abort() so dispatchAgent's
+      // resumed code classifies the cancellation correctly. The abort listener
+      // sends SIGTERM exactly once; the per-agent killTimer (if armed) escalates
+      // to SIGKILL after 5s.
       for (let i = 0; i < members.length; i++) {
         if (results[i]) continue;
-        const ref = procRefs[i];
-        if (ref?.proc) {
+        const ctl = controls[i];
+        if (ctl?.controller && !ctl.controller.signal.aborted) {
+          if (ctl.abortReason === null) ctl.abortReason = "grace";
           try {
-            ref.proc.kill("SIGTERM");
-            console.error(`    ${members[i].id}: SIGTERM (orphan kill)`);
+            ctl.controller.abort();
+            console.error(`    ${members[i].id}: aborted (quorum grace)`);
           } catch {}
         }
       }
 
-      // Fill in any still-pending agents as timeouts
+      // Fill in any still-pending agents as timeouts. The async dispatchAgent
+      // for these will eventually return with error_class:"cancelled" (because
+      // we set abortReason:"grace" above), but that result lands AFTER
+      // resolveAll has already fired with these placeholders — quorum is final.
       const final = results.map((r, i) => {
         if (r) return r;
         return {
@@ -432,6 +519,7 @@ async function dispatchWithQuorum(
           structured: false,
           response: "",
           error: "Skipped (quorum reached, grace period expired)",
+          error_class: "cancelled" as ErrorClass,
           duration_ms: 0,
           timestamp: new Date().toISOString(),
         };
@@ -445,7 +533,7 @@ async function dispatchWithQuorum(
         effort: effortByAgent[adapter.id] || "off",
         stream: false,
       };
-      dispatchAgentWithRetry(adapter, prompt, repoRoot, agentTimeout, agentOpts, retries, procRefs[i]).then((result) => {
+      dispatchAgentWithRetry(adapter, prompt, repoRoot, agentTimeout, agentOpts, retries, controls[i]).then((result) => {
         results[i] = result;
         completedCount++;
         if (result.status === "ok") {
