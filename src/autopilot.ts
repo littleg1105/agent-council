@@ -297,35 +297,44 @@ async function dispatchBootstrapCouncil(args: {
   repoRoot: string;
 }): Promise<string> {
   // Council expects a question file; write it to a temp path so it survives
-  // the council subprocess exit.
+  // the council subprocess exit. Cleaned up after dispatch (or attempt) —
+  // see the finally block below.
   const qPath = resolve(args.repoRoot, ".autopilot", ".bootstrap-question.tmp.md");
   mkdirSync(resolve(args.repoRoot, ".autopilot"), { recursive: true });
   writeFileSync(qPath, args.question, "utf-8");
 
-  console.error("[autopilot] Dispatching bootstrap council (3 agents, max-effort)...");
-  const proc = Bun.spawn([
-    "bun", "run", args.councilBin,
-    "--question-file", qPath,
-    "--project", "autopilot",
-    "--skip-preflight",
-  ], {
-    stdout: "pipe",
-    stderr: "inherit",  // let the user see the heartbeat live
-    cwd: args.repoRoot,
-  });
-  const stdoutText = await new Response(proc.stdout).text();
-  const exitCode = await proc.exited;
-  if (exitCode !== 0) {
-    throw new Error(`bootstrap council exited with code ${exitCode}`);
+  try {
+    console.error("[autopilot] Dispatching bootstrap council (3 agents, max-effort)...");
+    const proc = Bun.spawn([
+      "bun", "run", args.councilBin,
+      "--question-file", qPath,
+      "--project", "autopilot",
+      "--skip-preflight",
+    ], {
+      stdout: "pipe",
+      stderr: "inherit",  // let the user see the heartbeat live
+      cwd: args.repoRoot,
+    });
+    const stdoutText = await new Response(proc.stdout).text();
+    const exitCode = await proc.exited;
+    if (exitCode !== 0) {
+      throw new Error(`bootstrap council exited with code ${exitCode}`);
+    }
+    // The council's last stdout line is the session directory path
+    const lines = stdoutText.trim().split("\n").filter((l) => l.trim());
+    const sessionDir = lines[lines.length - 1].trim();
+    if (!existsSync(sessionDir)) {
+      throw new Error(`council returned non-existent session dir: ${sessionDir}`);
+    }
+    console.error(`[autopilot] Bootstrap council session: ${sessionDir}`);
+    return sessionDir;
+  } finally {
+    // Always clean up the temp question file, even on dispatch failure
+    try {
+      const { unlinkSync } = await import("fs");
+      if (existsSync(qPath)) unlinkSync(qPath);
+    } catch {}
   }
-  // The council's last stdout line is the session directory path
-  const lines = stdoutText.trim().split("\n").filter((l) => l.trim());
-  const sessionDir = lines[lines.length - 1].trim();
-  if (!existsSync(sessionDir)) {
-    throw new Error(`council returned non-existent session dir: ${sessionDir}`);
-  }
-  console.error(`[autopilot] Bootstrap council session: ${sessionDir}`);
-  return sessionDir;
 }
 
 /**
@@ -825,6 +834,9 @@ async function runLeafGoal(args: {
   while (args.goal.iteration < LIVE_MAX_ITERATIONS_PER_GOAL) {
     args.goal.iteration += 1;
     console.error(`[autopilot]   iteration ${args.goal.iteration}/${LIVE_MAX_ITERATIONS_PER_GOAL}`);
+    // Persist iteration count NOW so a mid-spawn crash (e.g., binary not in
+    // PATH) doesn't cause --resume to redo the iteration count from scratch.
+    await writeState(args.autopilotDir, args.state);
 
     // Regenerate AUTOPILOT.md with current state (per-spawn freshness).
     const docPath = resolve(args.autopilotDir, "AUTOPILOT.md");

@@ -19,6 +19,7 @@
 
 import type { ProjectProfile } from "./autopilot-profile";
 import { detectRateLimit, type RateLimitSignal } from "./autopilot-rate-limit";
+import { augmentEnvWithProjectBins } from "./autopilot-env";
 
 export interface SpawnResult {
   exitCode: number;
@@ -154,11 +155,34 @@ export async function spawnImplementingClaude(args: {
   if (effort !== "off") argv.push("--effort", effort);
   if (args.model) argv.push("--model", args.model);
 
-  const proc = Bun.spawn(argv, {
-    cwd: args.repoRoot,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  // Augment PATH with project-local bin dirs (.venv/bin, node_modules/.bin,
+  // etc.) so claude can invoke `poetry run pytest` / `npx vitest run` /
+  // `bundle exec rspec` even when the autopilot's parent shell doesn't have
+  // those tools globally installed. Real bug from the first live run on a
+  // Python+Poetry thesis project — see autopilot-env.ts.
+  const env = augmentEnvWithProjectBins(args.repoRoot);
+
+  // Bun.spawn THROWS synchronously when argv[0] isn't in PATH — without
+  // catching, that crashes the whole orchestrator. Wrap so it becomes a
+  // structured failure result the caller can handle (e.g. mark goal failed
+  // with a meaningful error_class).
+  let proc: ReturnType<typeof Bun.spawn>;
+  try {
+    proc = Bun.spawn(argv, {
+      cwd: args.repoRoot,
+      stdout: "pipe",
+      stderr: "pipe",
+      env,
+    });
+  } catch (e: any) {
+    return {
+      exitCode: -1,
+      stdout: "",
+      stderr: `spawn failed: ${e.message}`,
+      durationMs: Date.now() - startTime,
+      rateLimit: { isRateLimited: false, agent: "claude", window: "unknown", resetsAt: null, evidence: "" },
+    };
+  }
 
   let timedOut = false;
   const killTimer = setTimeout(() => {

@@ -24,6 +24,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync } from "fs";
 import { resolve, dirname, basename } from "path";
 import { tmpdir } from "os";
 import type { ProjectProfile } from "./autopilot-profile";
+import { augmentEnvForVerifier } from "./autopilot-env";
 
 export interface VerifyResult {
   passed: boolean;
@@ -95,16 +96,41 @@ export async function verifyInWorktree(args: {
     // of the lockfile and never written to during a test run.
     await shareDependencyDirs(args.repoRoot, tmpRoot, args.profile);
 
-    // Run the verify command. Strip API keys from env so test code can't
-    // covertly call out to LLMs.
-    const sanitizedEnv = sanitizeEnv(process.env);
+    // Run the verify command. augmentEnvForVerifier:
+    //   1. prepends project-local bin dirs (.venv/bin, node_modules/.bin)
+    //      to PATH — see autopilot-env.ts. Critical for Python+Poetry where
+    //      poetry/pytest live in .venv/bin and may not be in shell PATH.
+    //   2. strips API keys (ANTHROPIC_API_KEY, etc.) so test code can't
+    //      covertly call out to LLMs to fake a pass.
+    // We use args.repoRoot (the SOURCE repo) for PATH augmentation, not
+    // tmpRoot — the .venv is symlinked into the worktree but tools resolve
+    // against the symlink target, which lives in the source repo.
+    const env = augmentEnvForVerifier(args.repoRoot);
     const cmdParts = args.profile.spec_test_command(args.specPath).split(/\s+/).filter(Boolean);
-    const verify = Bun.spawn(cmdParts, {
-      cwd: tmpRoot,
-      stdout: "pipe",
-      stderr: "pipe",
-      env: sanitizedEnv,
-    });
+    let verify: ReturnType<typeof Bun.spawn>;
+    try {
+      verify = Bun.spawn(cmdParts, {
+        cwd: tmpRoot,
+        stdout: "pipe",
+        stderr: "pipe",
+        env,
+      });
+    } catch (e: any) {
+      // Binary not in PATH (poetry / pytest / cargo / etc.) — return a
+      // structured failure instead of crashing the orchestrator.
+      return {
+        passed: false,
+        exitCode: -1,
+        stdout: "",
+        stderr: `verifier spawn failed: ${e.message}\n` +
+          `command: ${cmdParts.join(" ")}\n` +
+          `Hint: ensure the project's tools are installed at ${resolve(args.repoRoot, ".venv/bin")} ` +
+          `(Python+Poetry) or ${resolve(args.repoRoot, "node_modules/.bin")} (Node), ` +
+          `or activate the appropriate venv before running the autopilot.`,
+        command: cmdParts.join(" "),
+        durationMs: Date.now() - startTime,
+      };
+    }
 
     let timedOut = false;
     const killTimer = setTimeout(() => {
@@ -177,31 +203,6 @@ async function shareDependencyDirs(srcRepo: string, worktree: string, profile: P
       // first test run (slow but correct)
     }
   }
-}
-
-/**
- * Strip API key env vars before spawning the verifier. The whole point of
- * the clean-checkout verifier is "the test code cannot covertly call out
- * to LLMs to fake a pass" — we enforce that at the env boundary.
- */
-function sanitizeEnv(env: NodeJS.ProcessEnv): Record<string, string> {
-  const REDACTED_PREFIXES = ["ANTHROPIC", "OPENAI", "OPENAI_API", "GEMINI", "GOOGLE_API", "CODEX", "CLAUDE"];
-  const REDACTED_EXACT = new Set([
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEY",
-    "CODEX_API_KEY",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-  ]);
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(env)) {
-    if (v === undefined) continue;
-    if (REDACTED_EXACT.has(k)) continue;
-    if (REDACTED_PREFIXES.some((p) => k.startsWith(p) && (k.endsWith("_KEY") || k.endsWith("_TOKEN") || k.endsWith("_API_KEY")))) continue;
-    out[k] = v;
-  }
-  return out;
 }
 
 /**
