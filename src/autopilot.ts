@@ -304,12 +304,37 @@ async function dispatchBootstrapCouncil(args: {
   writeFileSync(qPath, args.question, "utf-8");
 
   try {
-    console.error("[autopilot] Dispatching bootstrap council (3 agents, max-effort)...");
+    // Per the user's frustration on the first end-to-end run:
+    // codex was producing real output but kept getting aborted because the
+    // default 600s grace + retry combo couldn't accommodate codex's
+    // genuinely-long max-thinking. The fix is THREE flags:
+    //
+    //   --timeout-ms 1800000      30 min per agent (vs default 600s).
+    //                              Codex on a real codebase often needs
+    //                              10-20 min just to produce its decomposition.
+    //   --quorum-grace-ms 1800000  Match the timeout. With this, grace
+    //                              never expires before any pending agent's
+    //                              own per-agent timeout. No early cutoff.
+    //   --retries 0                No retry. Codex's first attempt gets the
+    //                              full 30-min budget; if it doesn't finish
+    //                              there, we accept the timeout (+ partial-
+    //                              on-timeout salvage). Retrying just steals
+    //                              from the same window for no benefit when
+    //                              the agent is slow rather than transiently
+    //                              failing.
+    //
+    // Net effect: each of the 3 agents has a fair 30-min window in parallel.
+    // Bootstrap might take up to 30 min worst case (the slowest agent).
+    // Acceptable for a one-off — guaranteed to NOT skip codex.
+    console.error("[autopilot] Dispatching bootstrap council (3 agents, max-effort, 30-min budget per agent, no retry)...");
     const proc = Bun.spawn([
       "bun", "run", args.councilBin,
       "--question-file", qPath,
       "--project", "autopilot",
       "--skip-preflight",
+      "--timeout-ms", "1800000",
+      "--quorum-grace-ms", "1800000",
+      "--retries", "0",
     ], {
       stdout: "pipe",
       stderr: "inherit",  // let the user see the heartbeat live

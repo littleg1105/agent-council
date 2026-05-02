@@ -587,10 +587,11 @@ async function runStage1(
   timeouts: Record<string, number>,
   effortByAgent: Record<string, EffortLevel>,
   modelsByAgent: Record<string, string>,
-  gracePeriodMs: number
+  gracePeriodMs: number,
+  retries: number = 1
 ): Promise<AgentResult[]> {
   const prompt = stage1Prompt(question, context);
-  return dispatchWithQuorum(members, prompt, repoRoot, timeouts, effortByAgent, modelsByAgent, gracePeriodMs, "Stage 1");
+  return dispatchWithQuorum(members, prompt, repoRoot, timeouts, effortByAgent, modelsByAgent, gracePeriodMs, "Stage 1", retries);
 }
 
 // --- Stage 2: Anonymized Peer Review ---
@@ -1036,6 +1037,9 @@ OPTIONS — main 'run' subcommand
   --skip-preflight           Skip the per-agent health probe (faster startup)
   --effort <level>           max | high | medium | low | off  (one-run override)
   --unbounded                Disable per-agent timeouts (~24-day cap; use only with care)
+  --timeout-ms <N>           Per-agent timeout in ms (one-run override; wins over --unbounded)
+  --quorum-grace-ms <N>      Quorum-grace window in ms (one-run override)
+  --retries <N>              Dispatch retry count on transient failures (default 1; set 0 to disable)
 
 DEFAULTS BY MODE
 
@@ -1095,6 +1099,12 @@ function parseArgs(): {
   nudgeCorrection?: string;
   effortOverride?: EffortLevel;
   unbounded: boolean;
+  /** Per-run override of per-agent timeout (ms). None of: per-mode default | config | CLI. */
+  timeoutMsOverride?: number;
+  /** Per-run override of quorum grace window (ms). */
+  quorumGraceMsOverride?: number;
+  /** Per-run override of dispatch retry count (default 1). */
+  retriesOverride?: number;
 } {
   const args = process.argv.slice(2);
 
@@ -1254,6 +1264,17 @@ function parseArgs(): {
     effortOverride = effortFlag;
   }
   const unbounded = args.includes("--unbounded");
+
+  // Per-run overrides for timeout/grace/retries. Used by the autopilot's
+  // bootstrap dispatch to give all 3 agents a fair, generous window
+  // without retry contention. See council-20260502-205303 — Fork 5B.
+  const timeoutMsFlag = getFlag(args, "--timeout-ms");
+  const timeoutMsOverride = timeoutMsFlag !== undefined ? parseIntFlag(timeoutMsFlag, "--timeout-ms") : undefined;
+  const graceMsFlag = getFlag(args, "--quorum-grace-ms");
+  const quorumGraceMsOverride = graceMsFlag !== undefined ? parseIntFlag(graceMsFlag, "--quorum-grace-ms") : undefined;
+  const retriesFlag = getFlag(args, "--retries");
+  const retriesOverride = retriesFlag !== undefined ? parseIntFlag(retriesFlag, "--retries") : undefined;
+
   return {
     command: "run",
     chairman,
@@ -1264,7 +1285,19 @@ function parseArgs(): {
     skipPreflight,
     effortOverride,
     unbounded,
+    timeoutMsOverride,
+    quorumGraceMsOverride,
+    retriesOverride,
   };
+}
+
+function parseIntFlag(value: string, flagName: string): number {
+  const n = parseInt(value, 10);
+  if (isNaN(n) || n < 0) {
+    console.error(`Error: invalid ${flagName} value "${value}". Must be a non-negative integer.`);
+    process.exit(1);
+  }
+  return n;
 }
 
 function getFlag(args: string[], flag: string): string | undefined {
@@ -1393,7 +1426,9 @@ export function buildContextBundle(files: string[], repoRoot: string): string {
 function applyOverrides(
   config: CouncilConfig,
   effortOverride: EffortLevel | undefined,
-  unbounded: boolean
+  unbounded: boolean,
+  timeoutMsOverride?: number,
+  quorumGraceMsOverride?: number
 ): CouncilConfig {
   const next: CouncilConfig = {
     models: { ...config.models },
@@ -1411,13 +1446,24 @@ function applyOverrides(
       gemini: UNBOUNDED_TIMEOUT_MS,
     };
   }
+  // CLI flag --timeout-ms wins over --unbounded if both passed
+  if (timeoutMsOverride !== undefined) {
+    next.timeout_ms = {
+      claude: timeoutMsOverride,
+      codex: timeoutMsOverride,
+      gemini: timeoutMsOverride,
+    };
+  }
+  if (quorumGraceMsOverride !== undefined) {
+    next.quorum_grace_ms = quorumGraceMsOverride;
+  }
   return next;
 }
 
 async function main(): Promise<void> {
   const parsed = parseArgs();
   let config = loadConfig(parsed.mode);
-  config = applyOverrides(config, parsed.effortOverride, parsed.unbounded);
+  config = applyOverrides(config, parsed.effortOverride, parsed.unbounded, parsed.timeoutMsOverride, parsed.quorumGraceMsOverride);
 
   // Handle subcommands
   if (parsed.command === "list") {
@@ -1529,6 +1575,9 @@ async function main(): Promise<void> {
   await writeSnapshot(sessionDir, context);
 
   // Stage 1: Independent opinions
+  // --retries CLI flag overrides the default (1). Autopilot bootstrap uses
+  // 0 to avoid retry-during-grace-window contention.
+  const stage1Retries = parsed.retriesOverride ?? 1;
   const opinions = await runStage1(
     members,
     question,
@@ -1537,7 +1586,8 @@ async function main(): Promise<void> {
     config.timeout_ms,
     config.effort,
     config.models,
-    config.quorum_grace_ms
+    config.quorum_grace_ms,
+    stage1Retries
   );
 
   // Write opinion files
